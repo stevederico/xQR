@@ -1,4 +1,8 @@
 <div align="center">
+  <img src="https://github.com/stevederico/xQR/raw/master/demo.png" alt="xQR Demo" width="400">
+</div>
+
+<div align="center">
   <h1>xQR</h1>
   <h3>QR Code Generator for X Profiles</h3>
   <p>Generate beautiful QR codes that link to any X (Twitter) profile</p>
@@ -8,14 +12,6 @@
     <a href="https://github.com/stevederico/xqr/issues"><img alt="Issues" src="https://img.shields.io/github/issues/stevederico/xqr"></a>
     <img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg">
   </p>
-</div>
-
-<br />
-
-## Demo
-
-<div align="center">
-  <img src="demo.png" alt="xQR Demo" width="800">
 </div>
 
 <br />
