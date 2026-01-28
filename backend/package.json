@@ -1,0 +1,20 @@
+{
+    "name": "xqr-backend",
+    "private": true,
+    "description": "xQR application backend",
+    "type": "module",
+    "engines": {
+        "node": ">=22.5.0"
+    },
+    "scripts": {
+        "start": "node --experimental-sqlite server.js"
+    },
+    "dependencies": {
+        "@hono/node-server": "^1.13.7",
+        "@xdevplatform/xdk": "^0.3.0",
+        "bcrypt": "^6.0.0",
+        "hono": "^4.6.14",
+        "jsonwebtoken": "^9.0.2",
+        "playwright": "^1.49.0"
+    }
+}

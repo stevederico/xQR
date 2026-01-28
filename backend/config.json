@@ -1,0 +1,5 @@
+{
+  "client": "http://localhost:5173",
+  "dbType": "sqlite",
+  "connectionString": "./databases/xQR.db"
+}
