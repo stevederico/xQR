@@ -71,6 +71,9 @@ coverage/
 AGENTS.md
 CLAUDE.md
 
+# Railway
+railway.json
+
 # Temporary Files
 *.cache
 .cache/

@@ -60,10 +60,10 @@ RUN npm run build
 
 # Set production mode after build
 ENV NODE_ENV production
-ENV PORT 8080
+ENV PORT 8000
 
 # Expose port
-EXPOSE 8080
+EXPOSE 8000
 
 # Start server with experimental SQLite
 CMD ["node", "--experimental-sqlite", "backend/server.js"]
