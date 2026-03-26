@@ -1,3 +1,7 @@
+1.1.1
+
+  Update CSP headers
+
 1.1.0
 
   Add Umami analytics

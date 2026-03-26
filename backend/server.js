@@ -270,7 +270,7 @@ app.use('*', compress());
 app.use('*', async (c, next) => {
   await next();
   c.header('Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://aob.bixbyapps.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https://aob.bixbyapps.com; frame-ancestors 'none';"
   );
   if (!isDevelopment) {
     c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
