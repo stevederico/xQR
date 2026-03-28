@@ -52,17 +52,17 @@ RUN npm install
 # Install Playwright WebKit browser only
 RUN npx playwright install webkit
 
+# Copy source
+COPY . .
+
 # Analytics env vars for build-time Vite injection
 ARG VITE_ANALYTICS_ID
 ARG VITE_ANALYTICS_SRC
 ENV VITE_ANALYTICS_ID=$VITE_ANALYTICS_ID
 ENV VITE_ANALYTICS_SRC=$VITE_ANALYTICS_SRC
 
-# Copy source
-COPY . .
-
-# Build frontend
-RUN npm run build
+# Build frontend (env vars must be set before this step)
+RUN echo "Analytics: $VITE_ANALYTICS_ID $VITE_ANALYTICS_SRC" && npm run build
 
 # Set production mode after build
 ENV NODE_ENV production
