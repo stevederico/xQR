@@ -55,9 +55,9 @@ RUN npx playwright install webkit
 # Copy source
 COPY . .
 
-# Build frontend (CACHEBUST invalidates Docker cache)
+# Build frontend
 ARG CACHEBUST=1
-RUN npm run build
+RUN echo "$CACHEBUST" && npm run build
 
 # Set production mode after build
 ENV NODE_ENV production
