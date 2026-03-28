@@ -1,3 +1,7 @@
+1.2.0
+
+  Use env var analytics
+
 1.1.1
 
   Update CSP headers

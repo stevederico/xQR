@@ -52,6 +52,12 @@ RUN npm install
 # Install Playwright WebKit browser only
 RUN npx playwright install webkit
 
+# Analytics env vars for build-time Vite injection
+ARG VITE_ANALYTICS_ID
+ARG VITE_ANALYTICS_SRC
+ENV VITE_ANALYTICS_ID=$VITE_ANALYTICS_ID
+ENV VITE_ANALYTICS_SRC=$VITE_ANALYTICS_SRC
+
 # Copy source
 COPY . .
 
