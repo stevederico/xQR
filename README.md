@@ -163,4 +163,6 @@ MIT License - see [LICENSE](LICENSE) file for details
 
 <div align="center">
   Made with ❤️ for the X community
+  <br />
+  Made with <a href="https://github.com/stevederico/skateboard">Skateboard</a> — a React boilerplate with auth and payments
 </div>
