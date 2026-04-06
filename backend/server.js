@@ -107,10 +107,20 @@ function generateCSRFToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
+// Extract client IP from x-forwarded-for (rightmost = set by trusted proxy)
+function getClientIP(c) {
+  const forwarded = c.req.header('x-forwarded-for');
+  if (forwarded) {
+    const ips = forwarded.split(',').map(ip => ip.trim());
+    return ips[ips.length - 1];
+  }
+  return 'unknown';
+}
+
 // Rate limiter middleware for Hono
 const rateLimiter = (maxRequests, windowMs, routeName = 'unknown') => {
   return async (c, next) => {
-    const key = c.req.header('x-forwarded-for') || 'unknown';
+    const key = getClientIP(c);
     const now = Date.now();
     const windowStart = now - windowMs;
 
@@ -190,7 +200,7 @@ setInterval(async () => {
 }, 24 * 60 * 60 * 1000);
 
 // ==== CONFIG & ENV ====
-if (!isProd()) {
+if (process.env.NODE_ENV !== 'production') {
   loadLocalENV();
 }
 
@@ -428,6 +438,11 @@ function cleanExpiredDiskCache() {
 async function cacheImage(imageUrl, cacheId) {
   if (!imageUrl) return null;
   try {
+    const parsed = new URL(imageUrl);
+    if (!['pbs.twimg.com', 'abs.twimg.com'].includes(parsed.hostname)) {
+      console.warn(`[CACHE] Blocked fetch to non-X domain: ${parsed.hostname}`);
+      return null;
+    }
     const response = await fetch(imageUrl);
     if (!response.ok) return null;
     const contentType = response.headers.get('content-type') || 'image/jpeg';
@@ -449,6 +464,10 @@ app.get("/health", (c) => c.json({ status: "ok", timestamp: Date.now() }));
 
 // Clear all caches (images + profiles + browser)
 app.get("/clear-cache", async (c) => {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret || c.req.query("key") !== secret) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
   try {
     // Clear image files
     const files = readdirSync(IMAGE_CACHE_DIR);
@@ -533,7 +552,7 @@ app.get("/user/:username", async (c) => {
     // Rate limit only applies to actual X API calls (cache misses)
     // Set DISABLE_RATE_LIMIT=true to disable
     if (process.env.DISABLE_RATE_LIMIT !== 'true') {
-      const ip = c.req.header('x-forwarded-for') || 'unknown';
+      const ip = getClientIP(c);
       const now = Date.now();
       const windowMs = 24 * 60 * 60 * 1000; // 24 hours
       const maxRequests = 3;
@@ -714,7 +733,6 @@ app.get("/qr/:username/image", async (c) => {
     context = await browser.newContext({
       viewport: { width, height },
       deviceScaleFactor: scale,
-      bypassCSP: true,
       colorScheme: theme,
     });
     // Disable caching
@@ -802,7 +820,7 @@ app.post("/signup", authLimiter, async (c) => {
 
       setCookie(c, 'token', token, {
         httpOnly: true,
-        secure: false,
+        secure: !isDevelopment,
         sameSite: 'Lax',
         path: '/',
         maxAge: tokenExpirationDays * 24 * 60 * 60
@@ -890,7 +908,7 @@ app.post("/signout", authMiddleware, async (c) => {
 app.get("/me", authMiddleware, async (c) => {
   const user = await databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { _id: c.get('userID') });
   if (!user) return c.json({ error: "User not found" }, 404);
-  return c.json(user);
+  return c.json({ id: user._id, email: user.email, name: user.name });
 });
 
 app.put("/me", authMiddleware, csrfProtection, async (c) => {
@@ -915,7 +933,7 @@ app.put("/me", authMiddleware, csrfProtection, async (c) => {
 
     await databaseManager.updateUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { _id: userID }, { $set: update });
     const updatedUser = await databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { _id: userID });
-    return c.json(updatedUser);
+    return c.json({ id: updatedUser._id, email: updatedUser.email, name: updatedUser.name });
   } catch (err) {
     console.error("Update user error:", err);
     return c.json({ error: "Failed to update user" }, 500);
@@ -999,15 +1017,16 @@ app.get('/:username', async (c) => {
 
   if (cached?.data) {
     const d = cached.data;
-    const title = `${d.name} (@${d.username})`;
-    const desc = d.description || `View ${d.name}'s X profile wallpaper`;
-    const img = d.profile_image_url ? `${c.req.url.split('/' + username)[0]}${d.profile_image_url}` : '/icons/icon.png';
+    const title = escapeHtml(`${d.name} (@${d.username})`);
+    const desc = escapeHtml(d.description || `View ${d.name}'s X profile wallpaper`);
+    const img = escapeHtml(d.profile_image_url ? `${c.req.url.split('/' + username)[0]}${d.profile_image_url}` : '/icons/icon.png');
+    const url = escapeHtml(c.req.url);
 
     html = html
       .replace(/<meta property="og:title" content="[^"]*">/, `<meta property="og:title" content="${title}">`)
       .replace(/<meta property="og:description" content="[^"]*">/, `<meta property="og:description" content="${desc}">`)
       .replace(/<meta property="og:image" content="[^"]*">/, `<meta property="og:image" content="${img}">`)
-      .replace(/<meta property="og:url" content="[^"]*">/, `<meta property="og:url" content="${c.req.url}">`)
+      .replace(/<meta property="og:url" content="[^"]*">/, `<meta property="og:url" content="${url}">`)
       .replace(/<meta name="twitter:title" content="[^"]*">/, `<meta name="twitter:title" content="${title}">`)
       .replace(/<meta name="twitter:description" content="[^"]*">/, `<meta name="twitter:description" content="${desc}">`)
       .replace(/<meta name="twitter:image" content="[^"]*">/, `<meta name="twitter:image" content="${img}">`);
@@ -1020,10 +1039,6 @@ app.get('/:username', async (c) => {
 app.get('*', serveStatic({ root: './backend/public', path: 'index.html' }));
 
 // ==== UTILITY FUNCTIONS ====
-function isProd() {
-  return process.env.ENV === "production";
-}
-
 function loadLocalENV() {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = dirname(__filename);

@@ -1,3 +1,7 @@
+2.1.0
+
+  Fix security vulnerabilities
+
 2.0.0
 
   Add dynamic OG tags
