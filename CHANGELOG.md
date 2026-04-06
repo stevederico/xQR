@@ -1,3 +1,7 @@
+1.4.0
+
+  Upgrade Vite to v8
+
 1.3.0
 
   Update all dependencies
