@@ -1004,7 +1004,7 @@ function loadLocalENV() {
       if (key && value) {
         key = key.trim();
         value = value.trim().replace(/^["']|["']$/g, '');
-        process.env[key] = value;
+        if (!process.env[key]) process.env[key] = value;
       }
     }
   } catch {}

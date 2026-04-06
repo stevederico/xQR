@@ -1,3 +1,7 @@
+1.5.0
+
+  Fix env var override
+
 1.4.0
 
   Upgrade Vite to v8
