@@ -1,4 +1,5 @@
-- Upgrade skateboard-ui from v1 to v2 (check for breaking changes in components)
-- Add caching headers for wallpaper images
+Upgrade skateboard-ui from v1 to v2 (check for breaking changes in components)
+  fix data pull
+  Add caching headers for wallpaper images
 - Add Open Graph meta tags for shared profile links
-- Support custom QR code colors/themes
+
