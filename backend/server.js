@@ -978,6 +978,41 @@ app.use('/assets/*', async (c, next) => {
   c.header('Cache-Control', 'public, max-age=31536000, immutable');
 });
 
+// Dynamic OG tags for profile links
+app.get('/:username', async (c, next) => {
+  const username = c.req.param('username');
+  // Skip non-username paths (files, assets, API routes)
+  if (username.includes('.') || username.startsWith('_')) return next();
+  if (!/^[a-zA-Z0-9_]{1,15}$/.test(username)) return next();
+
+  const cached = await databaseManager.getCachedProfile(
+    currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString,
+    username.toLowerCase()
+  );
+
+  const indexPath = resolve(dirname(fileURLToPath(import.meta.url)), './public/index.html');
+  let html;
+  try { html = readFileSync(indexPath, 'utf8'); } catch { return next(); }
+
+  if (cached?.data) {
+    const d = cached.data;
+    const title = `${d.name} (@${d.username})`;
+    const desc = d.description || `View ${d.name}'s X profile wallpaper`;
+    const img = d.profile_image_url ? `${c.req.url.split('/' + username)[0]}${d.profile_image_url}` : '/icons/icon.png';
+
+    html = html
+      .replace(/<meta property="og:title" content="[^"]*">/, `<meta property="og:title" content="${title}">`)
+      .replace(/<meta property="og:description" content="[^"]*">/, `<meta property="og:description" content="${desc}">`)
+      .replace(/<meta property="og:image" content="[^"]*">/, `<meta property="og:image" content="${img}">`)
+      .replace(/<meta property="og:url" content="[^"]*">/, `<meta property="og:url" content="${c.req.url}">`)
+      .replace(/<meta name="twitter:title" content="[^"]*">/, `<meta name="twitter:title" content="${title}">`)
+      .replace(/<meta name="twitter:description" content="[^"]*">/, `<meta name="twitter:description" content="${desc}">`)
+      .replace(/<meta name="twitter:image" content="[^"]*">/, `<meta name="twitter:image" content="${img}">`);
+  }
+
+  return c.html(html);
+});
+
 // Serve static files (built React app)
 app.use('/*', serveStatic({ root: './backend/public' }));
 app.get('*', serveStatic({ root: './backend/public', path: 'index.html' }));

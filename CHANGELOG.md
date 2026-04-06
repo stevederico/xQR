@@ -1,3 +1,7 @@
+2.0.0
+
+  Add dynamic OG tags
+
 1.9.0
 
   Remove animations and arrow
