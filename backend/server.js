@@ -978,21 +978,24 @@ app.use('/assets/*', async (c, next) => {
   c.header('Cache-Control', 'public, max-age=31536000, immutable');
 });
 
-// Dynamic OG tags for profile links
-app.get('/:username', async (c, next) => {
+// Serve static files (built React app)
+app.use('/*', serveStatic({ root: './backend/public' }));
+
+// Dynamic OG tags for profile links (after static, before SPA fallback)
+app.get('/:username', async (c) => {
   const username = c.req.param('username');
-  // Skip non-username paths (files, assets, API routes)
-  if (username.includes('.') || username.startsWith('_')) return next();
-  if (!/^[a-zA-Z0-9_]{1,15}$/.test(username)) return next();
+  if (!/^[a-zA-Z0-9_]{1,15}$/.test(username)) {
+    return c.html(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), './public/index.html'), 'utf8'));
+  }
+
+  const indexPath = resolve(dirname(fileURLToPath(import.meta.url)), './public/index.html');
+  let html;
+  try { html = readFileSync(indexPath, 'utf8'); } catch { return c.text('Not found', 404); }
 
   const cached = await databaseManager.getCachedProfile(
     currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString,
     username.toLowerCase()
   );
-
-  const indexPath = resolve(dirname(fileURLToPath(import.meta.url)), './public/index.html');
-  let html;
-  try { html = readFileSync(indexPath, 'utf8'); } catch { return next(); }
 
   if (cached?.data) {
     const d = cached.data;
@@ -1013,8 +1016,7 @@ app.get('/:username', async (c, next) => {
   return c.html(html);
 });
 
-// Serve static files (built React app)
-app.use('/*', serveStatic({ root: './backend/public' }));
+// SPA fallback for all other routes
 app.get('*', serveStatic({ root: './backend/public', path: 'index.html' }));
 
 // ==== UTILITY FUNCTIONS ====
