@@ -1,3 +1,7 @@
+1.3.0
+
+  Update all dependencies
+
 1.2.0
 
   Use env var analytics

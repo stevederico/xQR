@@ -10,11 +10,11 @@
         "start": "node --experimental-sqlite server.js"
     },
     "dependencies": {
-        "@hono/node-server": "^1.13.7",
-        "@xdevplatform/xdk": "^0.3.0",
+        "@hono/node-server": "^1.19.12",
+        "@xdevplatform/xdk": "^0.5.0",
         "bcrypt": "^6.0.0",
-        "hono": "^4.6.14",
-        "jsonwebtoken": "^9.0.2",
-        "playwright": "^1.49.0"
+        "hono": "^4.12.10",
+        "jsonwebtoken": "^9.0.3",
+        "playwright": "^1.59.1"
     }
 }
