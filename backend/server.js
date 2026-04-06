@@ -520,11 +520,12 @@ app.get("/user/:username", async (c) => {
     }
 
     // Check SQLite cache first (no rate limit for cached responses)
+    const forceRefresh = c.req.query('refresh') === '1';
     const cached = await databaseManager.getCachedProfile(
       currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString,
       cleanUsername
     );
-    if (cached && Date.now() - cached.cached_at < PROFILE_CACHE_TTL) {
+    if (!forceRefresh && cached && Date.now() - cached.cached_at < PROFILE_CACHE_TTL) {
       console.log(`[CACHE HIT] ${cleanUsername} (cached ${Math.round((Date.now() - cached.cached_at) / 3600000)}h ago)`);
       return c.json(cached.data);
     }
@@ -569,14 +570,16 @@ app.get("/user/:username", async (c) => {
     console.log("X API response for", cleanUsername, ":", JSON.stringify(user, null, 2));
 
     const urlEntity = user.entities?.url?.urls?.[0];
-    const displayUrl = urlEntity?.display_url || null;
-    const expandedUrl = urlEntity?.expanded_url || user.url;
+    const displayUrl = urlEntity?.display_url || urlEntity?.displayUrl || null;
+    const expandedUrl = urlEntity?.expanded_url || urlEntity?.expandedUrl || user.url;
 
     let description = user.description || '';
     const descriptionUrls = user.entities?.description?.urls || [];
     for (const urlInfo of descriptionUrls) {
-      if (urlInfo.url && urlInfo.display_url) {
-        description = description.replace(urlInfo.url, urlInfo.display_url);
+      const shortUrl = urlInfo.url;
+      const display = urlInfo.display_url || urlInfo.displayUrl;
+      if (shortUrl && display) {
+        description = description.replace(shortUrl, display);
       }
     }
 
@@ -584,31 +587,37 @@ app.get("/user/:username", async (c) => {
     const avatarId = `${cleanUsername}_avatar`;
     const bannerId = `${cleanUsername}_banner`;
 
+    // XDK returns camelCase (profileImageUrl), handle both formats
+    const profileImageUrl = user.profileImageUrl || user.profile_image_url;
+    const profileBannerUrl = user.profileBannerUrl || user.profile_banner_url;
+
     // Get higher res avatar (remove _normal suffix)
-    const hiResAvatar = user.profile_image_url?.replace('_normal', '_400x400');
+    const hiResAvatar = profileImageUrl?.replace('_normal', '_400x400');
 
     // Download images in parallel
     await Promise.all([
       cacheImage(hiResAvatar, avatarId),
-      cacheImage(user.profile_banner_url, bannerId)
+      cacheImage(profileBannerUrl, bannerId)
     ]);
+
+    const metrics = user.publicMetrics || user.public_metrics || {};
 
     const userData = {
       id: user.id,
       username: user.username,
       name: user.name,
-      profile_image_url: user.profile_image_url ? `/images/${avatarId}` : null,
-      profile_banner_url: user.profile_banner_url ? `/images/${bannerId}` : null,
+      profile_image_url: profileImageUrl ? `/images/${avatarId}` : null,
+      profile_banner_url: profileBannerUrl ? `/images/${bannerId}` : null,
       description,
       verified: user.verified,
-      verified_type: user.verified_type,
+      verified_type: user.verifiedType || user.verified_type,
       location: user.location,
       url: expandedUrl,
       display_url: displayUrl,
-      created_at: user.created_at,
-      followers_count: user.public_metrics?.followers_count,
-      following_count: user.public_metrics?.following_count,
-      tweet_count: user.public_metrics?.tweet_count
+      created_at: user.createdAt || user.created_at,
+      followers_count: metrics.followersCount || metrics.followers_count,
+      following_count: metrics.followingCount || metrics.following_count,
+      tweet_count: metrics.tweetCount || metrics.tweet_count
     };
 
     // Cache the response in SQLite

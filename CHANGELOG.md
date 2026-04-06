@@ -1,3 +1,7 @@
+1.6.0
+
+  Fix XDK camelCase mapping
+
 1.5.0
 
   Fix env var override
