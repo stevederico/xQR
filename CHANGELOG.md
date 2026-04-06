@@ -1,3 +1,7 @@
+1.9.0
+
+  Remove animations and arrow
+
 1.8.0
 
   Simplify home UI

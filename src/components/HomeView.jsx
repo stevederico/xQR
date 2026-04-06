@@ -555,7 +555,7 @@ export default function HomeView() {
 
       {/* Main card */}
       <div
-        className="relative w-full max-w-xs animate-fade-up bg-white/20 dark:bg-black/20 border border-white/20 dark:border-white/10 rounded-2xl p-5"
+        className="relative w-full max-w-xs bg-white/20 dark:bg-black/20 border border-white/20 dark:border-white/10 rounded-2xl p-5"
         style={{
           backdropFilter: 'blur(12px)',
           WebkitBackdropFilter: 'blur(12px)',
@@ -563,7 +563,7 @@ export default function HomeView() {
       >
         <form onSubmit={handleSubmit} className="space-y-3">
           {/* Username input */}
-          <div className="animate-fade-up animate-fade-up-delay-3">
+          <div>
             <div className="relative flex items-center">
               <span className="absolute left-3 text-gray-400 dark:text-gray-500 text-lg font-medium select-none">
                 @
@@ -590,7 +590,7 @@ export default function HomeView() {
           </div>
 
           {/* Submit button */}
-          <div className="animate-fade-up animate-fade-up-delay-4">
+          <div>
             <button
               type="submit"
               disabled={downloading}
@@ -619,9 +619,6 @@ export default function HomeView() {
                 ) : (
                   <>
                     Get X Wallpaper
-                    <svg className="w-5 h-5 transition-transform group-hover:translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                    </svg>
                   </>
                 )}
               </span>
