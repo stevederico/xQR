@@ -555,24 +555,13 @@ export default function HomeView() {
 
       {/* Main card */}
       <div
-        className="relative w-full max-w-sm animate-fade-up bg-white/20 dark:bg-black/20 border border-white/20 dark:border-white/10 rounded-3xl p-10"
+        className="relative w-full max-w-xs animate-fade-up bg-white/20 dark:bg-black/20 border border-white/20 dark:border-white/10 rounded-2xl p-5"
         style={{
           backdropFilter: 'blur(12px)',
           WebkitBackdropFilter: 'blur(12px)',
         }}
       >
-        {/* X logo mark */}
-        <div className="flex justify-center mb-4 animate-fade-up animate-fade-up-delay-1">
-          <div className="w-14 h-14 rounded-2xl flex items-center justify-center bg-black dark:bg-white shadow-lg">
-            <svg className="w-7 h-7 text-white dark:text-black" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
-            </svg>
-          </div>
-        </div>
-
-        <h1 className="text-2xl font-extrabold text-gray-900 dark:text-white tracking-tight text-center mb-5 animate-fade-up animate-fade-up-delay-2 whitespace-nowrap">QR Code Wallpaper</h1>
-
-        <form onSubmit={handleSubmit} className="space-y-5">
+        <form onSubmit={handleSubmit} className="space-y-3">
           {/* Username input */}
           <div className="animate-fade-up animate-fade-up-delay-3">
             <div className="relative flex items-center">
@@ -594,7 +583,7 @@ export default function HomeView() {
                 data-form-type="other"
                 data-lpignore="true"
                 data-1p-ignore
-                className="w-full pl-8 pr-4 py-4 rounded-xl text-gray-900 dark:text-white bg-gray-100 dark:bg-white/5 border border-gray-200 dark:border-white/10 placeholder:text-gray-400 dark:placeholder:text-gray-600 focus:outline-none focus:border-gray-400 dark:focus:border-gray-500 transition-colors text-base"
+                className="w-full pl-8 pr-4 py-3 rounded-xl text-gray-900 dark:text-white bg-gray-100 dark:bg-white/5 border border-gray-200 dark:border-white/10 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:border-gray-400 dark:focus:border-gray-500 transition-colors text-base"
                 required
               />
             </div>
@@ -605,7 +594,7 @@ export default function HomeView() {
             <button
               type="submit"
               disabled={downloading}
-              className="w-full py-4 rounded-xl font-semibold transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed relative overflow-hidden group bg-black dark:bg-white text-white dark:text-black hover:bg-gray-800 dark:hover:bg-gray-100 shadow-lg"
+              className="w-full py-3 rounded-xl font-semibold text-sm transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed relative overflow-hidden group bg-black dark:bg-white text-white dark:text-black hover:bg-gray-800 dark:hover:bg-gray-100 shadow-lg"
             >
               {/* Shimmer effect */}
               {!downloading && (
@@ -629,7 +618,7 @@ export default function HomeView() {
                   </>
                 ) : (
                   <>
-                    Generate
+                    Get X Wallpaper
                     <svg className="w-5 h-5 transition-transform group-hover:translate-x-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
                     </svg>

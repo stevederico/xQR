@@ -1,3 +1,7 @@
+1.8.0
+
+  Simplify home UI
+
 1.7.0
 
   Add username route

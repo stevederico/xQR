@@ -1,7 +1,7 @@
 {
     "appName": "xQR",
     "appIcon": "qr-code",
-    "tagline": "Generate QR codes for any X profile",
+    "tagline": "Generate wallpapers for any X profile",
     "cta": "Create Your QR",
     "noLogin": true,
     "noLanding": true,
