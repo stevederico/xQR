@@ -460,7 +460,7 @@ async function cacheImage(imageUrl, cacheId) {
 // ==== ROUTES ====
 
 // Health check
-app.get("/health", (c) => c.json({ status: "ok", timestamp: Date.now() }));
+app.get("/health", (c) => c.json({ status: "ok", timestamp: Date.now(), version: "2.1.0" }));
 
 // Clear all caches (images + profiles + browser)
 app.get("/clear-cache", async (c) => {
