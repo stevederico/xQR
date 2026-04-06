@@ -15,6 +15,7 @@ createRoot(document.getElementById('root')).render(
     <Routes>
       <Route path="/" element={<HomeView />} />
       <Route path="/app/home" element={<HomeView />} />
+      <Route path="/:username" element={<HomeView />} />
       <Route path="*" element={<HomeView />} />
     </Routes>
   </BrowserRouter>

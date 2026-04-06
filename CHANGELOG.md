@@ -1,3 +1,7 @@
+1.7.0
+
+  Add username route
+
 1.6.0
 
   Fix XDK camelCase mapping
