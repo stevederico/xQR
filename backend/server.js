@@ -236,7 +236,11 @@ if (!JWT_SECRET) {
   console.warn('⚠️  JWT_SECRET not set - authentication disabled');
 }
 
-console.log('✅ Backend initialized');
+// Startup diagnostics
+console.log(`✅ Backend initialized`);
+console.log(`[BOOT] Node ${process.version} | env=${process.env.NODE_ENV || 'development'}`);
+console.log(`[BOOT] X API: ${X_BEARER_TOKEN ? 'configured' : 'MISSING'} | JWT: ${JWT_SECRET ? 'configured' : 'MISSING'}`);
+console.log(`[BOOT] DB: ${currentDbConfig?.dbType} @ ${currentDbConfig?.connectionString || 'default'}`);
 
 const isDevelopment = process.env.NODE_ENV !== 'production';
 
@@ -548,6 +552,7 @@ app.get("/user/:username", async (c) => {
       rateLimitStore.set(ip, requests);
     }
 
+    console.log(`[X API] Fetching profile for: ${cleanUsername}`);
     const response = await xClient.users.getByUsername(cleanUsername, {
       "user.fields": [
         "profile_image_url", "profile_banner_url", "name", "description",
@@ -615,7 +620,7 @@ app.get("/user/:username", async (c) => {
 
     return c.json(userData);
   } catch (error) {
-    console.error("X API error:", error.message);
+    console.error(`[X API] Error for ${c.req.param("username")}:`, error.message, error.status || '');
     if (error.status === 404) {
       return c.json({ error: "User not found" }, 404);
     }
@@ -674,8 +679,10 @@ app.get("/qr/:username/image", async (c) => {
     });
   }
 
+  console.log(`[SCREENSHOT] Starting for ${cleanUsername} (${width}x${height} @${scale}x ${theme})`);
   const browser = await getBrowser();
   if (!browser) {
+    console.error(`[SCREENSHOT] Browser unavailable for ${cleanUsername}`);
     return c.json({ error: "Screenshot service unavailable" }, 503);
   }
 
@@ -740,7 +747,7 @@ app.get("/qr/:username/image", async (c) => {
       'Cache-Control': 'no-store'
     });
   } catch (error) {
-    console.error("Screenshot error:", error.message);
+    console.error(`[SCREENSHOT] Failed for ${cleanUsername}:`, error.message, error.stack?.split('\n')[1]?.trim());
     if (context) await context.close();
     return c.json({ error: "Failed to generate image" }, 500);
   }
@@ -1012,6 +1019,8 @@ const server = serve({
   hostname: '::'
 }, (info) => {
   console.log(`✅ Server running on port ${info.port}`);
+  console.log(`[BOOT] Playwright: lazy-loaded on first screenshot request`);
+  console.log(`[BOOT] Profile cache TTL: ${PROFILE_CACHE_TTL / 3600000}h | Screenshot cache TTL: ${SCREENSHOT_CACHE_TTL / 3600000}h`);
 });
 
 // Graceful shutdown
