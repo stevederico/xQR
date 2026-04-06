@@ -79,6 +79,18 @@ export class SQLiteProvider {
         cached_at INTEGER NOT NULL
       )
     `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ProfileLookups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        ip TEXT,
+        source TEXT DEFAULT 'web',
+        looked_up_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_lookups_username ON ProfileLookups(username)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_lookups_time ON ProfileLookups(looked_up_at)`);
   }
 
   // Profile cache methods
@@ -162,6 +174,16 @@ export class SQLiteProvider {
   async setProfileImage(db, id, imageBuffer, contentType) {
     const sql = `INSERT OR REPLACE INTO ProfileImages (id, image, content_type, cached_at) VALUES (?, ?, ?, ?)`;
     db.prepare(sql).run(id, imageBuffer, contentType, Date.now());
+  }
+
+  async logProfileLookup(db, username, ip, source = 'web') {
+    const sql = `INSERT INTO ProfileLookups (username, ip, source, looked_up_at) VALUES (?, ?, ?, ?)`;
+    db.prepare(sql).run(username.toLowerCase(), ip || null, source, Date.now());
+  }
+
+  async getProfileLookups(db, limit = 100) {
+    const sql = "SELECT * FROM ProfileLookups ORDER BY looked_up_at DESC LIMIT ?";
+    return db.prepare(sql).all(limit);
   }
 
   async cleanExpiredProfileImages(db, maxAgeMs) {

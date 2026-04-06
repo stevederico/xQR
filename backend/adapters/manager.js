@@ -104,6 +104,16 @@ class DatabaseManager {
     return await provider.setProfileImage(database, id, imageBuffer, contentType);
   }
 
+  async logProfileLookup(dbType, dbName, connectionString, username, ip, source) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.logProfileLookup(database, username, ip, source);
+  }
+
+  async getProfileLookups(dbType, dbName, connectionString, limit) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.getProfileLookups(database, limit);
+  }
+
   async closeAll() {
     if (this.provider) {
       await this.provider.closeAll();

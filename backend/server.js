@@ -538,6 +538,12 @@ app.get("/user/:username", async (c) => {
       return c.json({ error: "Invalid username format" }, 400);
     }
 
+    // Log the lookup (fire and forget — don't block the response)
+    databaseManager.logProfileLookup(
+      currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString,
+      cleanUsername, getClientIP(c), 'api'
+    ).catch(() => {});
+
     // Check SQLite cache first (no rate limit for cached responses)
     const forceRefresh = c.req.query('refresh') === '1';
     const cached = await databaseManager.getCachedProfile(

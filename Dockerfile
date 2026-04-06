@@ -65,5 +65,8 @@ ENV PORT 8000
 # Expose port
 EXPOSE 8000
 
+# Link databases dir to Railway volume mount point
+RUN mkdir -p /data && ln -sf /data /app/databases
+
 # Start server with experimental SQLite
 CMD ["node", "--experimental-sqlite", "backend/server.js"]
