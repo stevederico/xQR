@@ -462,6 +462,20 @@ async function cacheImage(imageUrl, cacheId) {
 // Health check
 app.get("/health", (c) => c.json({ status: "ok", timestamp: Date.now(), version: "2.1.0" }));
 
+// View profile lookups log
+app.get("/lookups", async (c) => {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret || c.req.query("key") !== secret) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  const limit = Math.min(parseInt(c.req.query("limit") || "100"), 1000);
+  const lookups = await databaseManager.getProfileLookups(
+    currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString,
+    limit
+  );
+  return c.json({ count: lookups.length, lookups });
+});
+
 // Clear all caches (images + profiles + browser)
 app.get("/clear-cache", async (c) => {
   const secret = process.env.ADMIN_SECRET;
