@@ -236,12 +236,6 @@ if (!JWT_SECRET) {
   console.warn('⚠️  JWT_SECRET not set - authentication disabled');
 }
 
-// Startup diagnostics
-console.log(`✅ Backend initialized`);
-console.log(`[BOOT] Node ${process.version} | env=${process.env.NODE_ENV || 'development'}`);
-console.log(`[BOOT] X API: ${X_BEARER_TOKEN ? 'configured' : 'MISSING'} | JWT: ${JWT_SECRET ? 'configured' : 'MISSING'}`);
-console.log(`[BOOT] DB: ${currentDbConfig?.dbType} @ ${currentDbConfig?.connectionString || 'default'}`);
-
 const isDevelopment = process.env.NODE_ENV !== 'production';
 
 // ==== DATABASE CONFIG ====
@@ -254,6 +248,12 @@ if (X_BEARER_TOKEN) {
 } else {
   console.warn('⚠️  X_BEARER_TOKEN not set - X API functionality disabled');
 }
+
+// Startup diagnostics
+console.log(`✅ Backend initialized`);
+console.log(`[BOOT] Node ${process.version} | env=${process.env.NODE_ENV || 'development'}`);
+console.log(`[BOOT] X API: ${X_BEARER_TOKEN ? 'configured' : 'MISSING'} | JWT: ${JWT_SECRET ? 'configured' : 'MISSING'}`);
+console.log(`[BOOT] DB: ${currentDbConfig.dbType} @ ${currentDbConfig.connectionString}`);
 
 // ==== HONO SETUP ====
 const app = new Hono();
