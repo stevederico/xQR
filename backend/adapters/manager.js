@@ -51,6 +51,11 @@ class DatabaseManager {
     return await provider.insertAuth(database, authData);
   }
 
+  async updateAuth(dbType, dbName, connectionString, query, update) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.updateAuth(database, query, update);
+  }
+
   async executeQuery(dbType, dbName, connectionString, queryObject) {
     const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
     return await provider.execute(database, queryObject);

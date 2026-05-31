@@ -5,8 +5,7 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { cors } from "hono/cors";
 import { compress } from "hono/compress";
-import jwt from "jsonwebtoken";
-import bcrypt from "bcrypt";
+import { compare as legacyBcryptCompare } from "./vendor/legacy-bcrypt.js";
 import crypto from "crypto";
 import { Client } from "@xdevplatform/xdk";
 
@@ -308,25 +307,79 @@ app.use('*', globalLimiter);
 
 const tokenExpirationDays = 30;
 
-// ==== BCRYPT HELPERS ====
+// ==== PASSWORD HELPERS (native node:crypto scrypt) ====
+const scryptAsync = promisify(crypto.scrypt);
+const SCRYPT_KEYLEN = 64;
+const SCRYPT_SALTLEN = 16;
+
+// Hash a password with scrypt. Format: scrypt$<base64url salt>$<base64url key>.
+// New hashes always use scrypt; legacy bcrypt hashes ($2 prefix) are verify-only.
 async function hashPassword(password) {
-  const salt = await bcrypt.genSalt(10);
-  return await bcrypt.hash(password, salt);
+  const salt = crypto.randomBytes(SCRYPT_SALTLEN);
+  const key = await scryptAsync(password, salt, SCRYPT_KEYLEN);
+  return `scrypt$${salt.toString('base64url')}$${key.toString('base64url')}`;
 }
 
-async function verifyPassword(password, hash) {
-  return await bcrypt.compare(password, hash);
+// Verify a password against a scrypt hash, or a legacy bcrypt hash ($2 prefix).
+async function verifyPassword(password, stored) {
+  if (typeof stored !== 'string') return false;
+  if (stored.startsWith('scrypt$')) {
+    const [, saltB64, keyB64] = stored.split('$');
+    const salt = Buffer.from(saltB64, 'base64url');
+    const expected = Buffer.from(keyB64, 'base64url');
+    const candidate = await scryptAsync(password, salt, SCRYPT_KEYLEN);
+    return expected.length === candidate.length && crypto.timingSafeEqual(expected, candidate);
+  }
+  if (stored.startsWith('$2')) {
+    return await legacyBcryptCompare(password, stored);
+  }
+  return false;
 }
 
-// ==== JWT HELPERS ====
+// True if a stored hash should be migrated to scrypt on next successful login.
+function needsRehash(stored) {
+  return typeof stored === 'string' && !stored.startsWith('scrypt$');
+}
+
+// ==== JWT HELPERS (native node:crypto HS256, byte-compatible with jsonwebtoken) ====
 function tokenExpireTimestamp() {
   return Math.floor(Date.now() / 1000) + tokenExpirationDays * 24 * 60 * 60;
+}
+
+// Sign an HS256 JWT. Header {"alg":"HS256","typ":"JWT"} matches jsonwebtoken byte-for-byte.
+function jwtSign(payload, secret) {
+  const head = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
+  return `${head}.${body}.${sig}`;
+}
+
+// Verify an HS256 JWT (compatible with tokens issued by jsonwebtoken).
+// Throws Error with name 'TokenExpiredError' for expired tokens.
+function jwtVerify(token, secret) {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Invalid token');
+  const [head, body, sig] = parts;
+  if (!head || !body || !sig) throw new Error('Invalid token');
+  const expected = crypto.createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expected);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    throw new Error('Invalid signature');
+  }
+  const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+    const err = new Error('Token expired');
+    err.name = 'TokenExpiredError';
+    throw err;
+  }
+  return payload;
 }
 
 async function generateToken(userID) {
   if (!JWT_SECRET) throw new Error("JWT_SECRET not configured");
   const exp = tokenExpireTimestamp();
-  return jwt.sign({ userID, exp }, JWT_SECRET, { algorithm: 'HS256' });
+  return jwtSign({ userID, exp }, JWT_SECRET);
 }
 
 // Auth middleware for Hono
@@ -341,7 +394,7 @@ async function authMiddleware(c, next) {
   }
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
+    const payload = jwtVerify(token, JWT_SECRET);
     c.set('userID', payload.userID);
     await next();
   } catch (error) {
@@ -881,6 +934,16 @@ app.post("/signin", authLimiter, async (c) => {
     const auth = await databaseManager.findAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { email });
     if (!auth || !(await verifyPassword(password, auth.password))) {
       return c.json({ error: "Invalid credentials" }, 401);
+    }
+
+    // Lazy migrate legacy bcrypt hash to scrypt (best-effort, never blocks login)
+    if (needsRehash(auth.password)) {
+      try {
+        const newHash = await hashPassword(password);
+        await databaseManager.updateAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { email }, { password: newHash });
+      } catch (e) {
+        console.error('Password rehash failed:', e.message);
+      }
     }
 
     const user = await databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { email });

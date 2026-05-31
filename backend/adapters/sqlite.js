@@ -310,6 +310,15 @@ export class SQLiteProvider {
     return { insertedId: email };
   }
 
+  async updateAuth(db, query, update) {
+    const { email } = query;
+    const { password } = update;
+    if (typeof password !== 'string') return { modifiedCount: 0 };
+    const sql = "UPDATE Auths SET password = ? WHERE email = ?";
+    const result = db.prepare(sql).run(password, email);
+    return { modifiedCount: result.changes };
+  }
+
   async execute(db, queryObject) {
     const startTime = Date.now();
     
