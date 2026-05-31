@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router";
 import qrcode from 'qrcode-generator';
 import { version } from '../../package.json';
 import demoWallpaperLight from '../assets/demo-wallpaper-light.webp';

@@ -12,9 +12,7 @@
     "dependencies": {
         "@hono/node-server": "^1.19.12",
         "@xdevplatform/xdk": "^0.5.0",
-        "bcrypt": "^6.0.0",
         "hono": "^4.12.10",
-        "jsonwebtoken": "^9.0.3",
         "playwright": "^1.59.1"
     }
 }

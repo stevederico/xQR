@@ -1,6 +1,6 @@
 import './assets/styles.css';
 import { createRoot } from 'react-dom/client';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { BrowserRouter, Routes, Route } from 'react-router';
 import HomeView from './components/HomeView.jsx';
 
 const s = document.createElement('script');
