@@ -4,7 +4,7 @@
   "version": "2.1.0",
   "type": "module",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=24.0.0"
   },
   "workspaces": [
     "backend"
@@ -12,7 +12,7 @@
   "scripts": {
     "start": "npm run front & npm run server",
     "front": "vite --force --mode development",
-    "server": "npm run --workspace=backend start",
+    "server": "npm run --workspace=backend dev",
     "build": "vite build --mode production && rm -rf backend/public && cp -r dist backend/public",
     "prod": "node --experimental-sqlite backend/server.js",
     "install-all": "npm install && npm install --workspace=backend",
@@ -31,5 +31,6 @@
     "@vitejs/plugin-react-swc": "^4.3.0",
     "tailwindcss": "4.2.2",
     "vite": "^8.0.3"
-  }
+  },
+  "skateboardVersion": "3.6.1"
 }

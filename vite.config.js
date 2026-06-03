@@ -4,25 +4,33 @@ import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
 import fs from 'node:fs';
 
-// ===== CUSTOM VITE PLUGINS =====
-
 /**
- * Custom logger plugin for Vite
+ * Custom logger plugin to simplify Vite server startup output
+ *
+ * Overrides default Vite URL printer to show single clean message.
+ * Suppresses verbose network address output.
+ *
+ * @returns {import('vite').Plugin} Vite plugin object
  */
 const customLoggerPlugin = () => {
     return {
         name: 'custom-logger',
         configureServer(server) {
             server.printUrls = () => {
-                console.log(`🖥️  React is running on http://localhost:${server.config.server.port || 5173}`);
+                console.log(`React is running on http://localhost:${server.config.server.port || 5173}`);
             };
         }
     };
 };
 
 /**
- * HTML replacement plugin
- * Replaces {{APP_NAME}}, {{TAGLINE}}, {{COMPANY_WEBSITE}} in index.html
+ * HTML template variable replacement plugin
+ *
+ * Replaces {{APP_NAME}}, {{TAGLINE}}, {{COMPANY_WEBSITE}} placeholders
+ * in index.html with values from constants.json at build time. Enables
+ * dynamic metadata without build script complexity.
+ *
+ * @returns {import('vite').Plugin} Vite plugin object
  */
 const htmlReplacePlugin = () => {
     return {
@@ -39,7 +47,15 @@ const htmlReplacePlugin = () => {
 };
 
 /**
- * Dynamic robots.txt plugin
+ * Dynamic robots.txt generation plugin
+ *
+ * Generates robots.txt at build time with:
+ * - Bot-specific rules (Googlebot, Bingbot, Applebot, social crawlers)
+ * - Protected routes (/app/, /console/, /signin/, /signup/)
+ * - Sitemap reference from constants.json
+ * - Disallows all other bots from entire site
+ *
+ * @returns {import('vite').Plugin} Vite plugin object
  */
 const dynamicRobotsPlugin = () => {
     return {
@@ -50,43 +66,30 @@ const dynamicRobotsPlugin = () => {
                 ? constants.companyWebsite
                 : `https://${constants.companyWebsite}`;
 
-            const robotsContent = `User-agent: Googlebot
-Disallow: /app/
-Disallow: /console/
-Disallow: /signin/
-Disallow: /signup/
+            const robotsContent = `User-agent: *
+Allow: /
 
-User-agent: Bingbot
-Disallow: /app/
-Disallow: /console/
-Disallow: /signin/
-Disallow: /signup/
+# AI search bots — welcome
+User-agent: GPTBot
+Allow: /
 
-User-agent: Applebot
-Disallow: /app/
-Disallow: /console/
-Disallow: /signin/
-Disallow: /signup/
+User-agent: ChatGPT-User
+Allow: /
 
-User-agent: facebookexternalhit
-Disallow: /app/
-Disallow: /console/
-Disallow: /signin/
-Disallow: /signup/
+User-agent: PerplexityBot
+Allow: /
 
-User-agent: Facebot
-Disallow: /app/
-Disallow: /console/
-Disallow: /signin/
-Disallow: /signup/
+User-agent: ClaudeBot
+Allow: /
 
-User-agent: Twitterbot
-Disallow: /app/
-Disallow: /console/
-Disallow: /signin/
-Disallow: /signup/
+User-agent: anthropic-ai
+Allow: /
 
-User-agent: *
+User-agent: Google-Extended
+Allow: /
+
+# Block training-only crawlers
+User-agent: CCBot
 Disallow: /
 
 Sitemap: ${website}/sitemap.xml
@@ -102,7 +105,18 @@ Sitemap: ${website}/sitemap.xml
 };
 
 /**
- * Dynamic sitemap.xml plugin
+ * Dynamic sitemap.xml generation plugin
+ *
+ * Generates sitemap.xml at build time with static pages:
+ * - / (priority 1.0, weekly)
+ * - /terms (priority 0.8, monthly)
+ * - /privacy (priority 0.8, monthly)
+ * - /subs (priority 0.7, monthly)
+ * - /eula (priority 0.7, monthly)
+ *
+ * Uses current build date for lastmod. Reads website URL from constants.json.
+ *
+ * @returns {import('vite').Plugin} Vite plugin object
  */
 const dynamicSitemapPlugin = () => {
     return {
@@ -159,7 +173,18 @@ const dynamicSitemapPlugin = () => {
 };
 
 /**
- * Dynamic manifest.json plugin
+ * Dynamic PWA manifest.json generation plugin
+ *
+ * Generates Web App Manifest at build time with:
+ * - App name and description from constants.json
+ * - Icon configuration (192x192 SVG)
+ * - Standalone display mode
+ * - Start URL pointing to /app
+ * - Black theme color, white background
+ *
+ * Enables Add to Home Screen and PWA functionality.
+ *
+ * @returns {import('vite').Plugin} Vite plugin object
  */
 const dynamicManifestPlugin = () => {
     return {
@@ -209,10 +234,13 @@ export default defineConfig({
     drop: []
   },
   resolve: {
+    dedupe: ['react', 'react-dom', 'react-router-dom', 'react-router'],
     alias: {
       '@': path.resolve(process.cwd(), './src'),
       '@package': path.resolve(process.cwd(), 'package.json'),
       '@root': path.resolve(process.cwd()),
+      'react': path.resolve(process.cwd(), 'node_modules/react'),
+      'react-dom': path.resolve(process.cwd(), 'node_modules/react-dom'),
       'react/jsx-runtime': path.resolve(process.cwd(), 'node_modules/react/jsx-runtime.js')
     }
   },
@@ -222,10 +250,14 @@ export default defineConfig({
       'react-dom',
       'react-dom/client',
       '@radix-ui/react-slot',
+      'react-router-dom',
+      'react-router',
       'cookie',
       'set-cookie-parser'
     ],
+    force: true,
     exclude: [
+      '@stevederico/skateboard-ui',
       '@swc/core',
       '@swc/core-darwin-arm64',
       '@swc/wasm',
@@ -258,8 +290,10 @@ export default defineConfig({
     open: false,
     port: 5173,
     strictPort: false,
+    // Don't pin the HMR port — Vite derives it from the resolved server port.
+    // Hardcoding 5173 broke HMR ("WebSocket closed without opened") whenever
+    // 5173 was taken and the server fell back to 5174 while HMR still dialed 5173.
     hmr: {
-      port: 5173,
       overlay: false
     },
     watch: {

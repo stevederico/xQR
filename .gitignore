@@ -1,40 +1,5 @@
-# Environment Variables
-.env
-.env.local
-.env.*.local
-*.env
-backend/.env
-
-# Allow example env files
-!.env.example
-!**/.env.example
-
-# Dependencies
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-package-lock.json
-yarn.lock
-deno.lock
-
-# Build Outputs
-dist/
-dist-ssr/
-build/
-*.local
-backend/public/
-
-# Editor and IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
 # Logs
-logs/
+logs
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -42,41 +7,39 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-# Database Files
-*.db
-*.sqlite
-*.sqlite3
-backend/databases/*.db
-!backend/databases/.gitkeep
+node_modules
+dist
+dist-ssr
+*.local
 
-# Sensitive Files
-*.pem
-*.key
-*.cert
-*.crt
-*secret*
-credentials.json
-config/secrets.*
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+backend/.env
 
-# OS
+.claude/
+.agent-browser/
+.playwright-mcp/
+deno.lock
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
 .DS_Store
-Thumbs.db
-*.tmp
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
 
-# Testing
-coverage/
-.nyc_output/
+# Database files
+*.db
+*.db-shm
+*.db-wal
 
-# AI Agent Files (for local development)
-AGENTS.md
-CLAUDE.md
-
-# Railway
-railway.json
-
-# Temporary Files
-*.cache
-.cache/
-.temp/
-tmp/
-temp/
+MIGRATION_GUIDE-0.9.8.md
+SKATEBOARD_UI_EXTENSIONS_PROPOSAL.md

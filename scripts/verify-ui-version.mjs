@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Fail if installed @stevederico/skateboard-ui does not match package.json,
- * or if Deno install artifacts are still present.
+ * or if Deno install artifacts are still present. Run from an app root (cwd).
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
