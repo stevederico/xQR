@@ -19,7 +19,7 @@
     "verify:ui": "node scripts/verify-ui-version.mjs"
   },
   "dependencies": {
-    "@stevederico/skateboard-ui": "3.8.0",
+    "@stevederico/skateboard-ui": "3.8.1",
     "qrcode-generator": "^2.0.4",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
