@@ -270,6 +270,89 @@ class DatabaseManager {
     return await provider.execute(database, queryObject);
   }
 
+  // ==== X PROFILE / IMAGE CACHE (custom xQR methods) ====
+
+  /**
+   * Get a cached X profile by username.
+   * @returns {Promise<{username: string, data: Object, cached_at: number}|null>}
+   */
+  async getCachedProfile(dbType, dbName, connectionString, username) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.getCachedProfile(database, username);
+  }
+
+  /**
+   * Upsert a cached X profile.
+   * @returns {Promise<void>}
+   */
+  async setCachedProfile(dbType, dbName, connectionString, username, data) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.setCachedProfile(database, username, data);
+  }
+
+  /**
+   * Delete profiles cached before now - maxAgeMs.
+   * @returns {Promise<number>} Rows deleted
+   */
+  async cleanExpiredProfiles(dbType, dbName, connectionString, maxAgeMs) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.cleanExpiredProfiles(database, maxAgeMs);
+  }
+
+  /**
+   * Delete all cached profiles.
+   * @returns {Promise<number>} Rows deleted
+   */
+  async clearAllProfiles(dbType, dbName, connectionString) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.clearAllProfiles(database);
+  }
+
+  /**
+   * Get a cached screenshot by cache key.
+   * @returns {Promise<{username: string, image: Uint8Array, cached_at: number}|null>}
+   */
+  async getCachedImage(dbType, dbName, connectionString, username) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.getCachedImage(database, username);
+  }
+
+  /**
+   * Upsert a cached screenshot.
+   * @returns {Promise<void>}
+   */
+  async setCachedImage(dbType, dbName, connectionString, username, imageBuffer) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.setCachedImage(database, username, imageBuffer);
+  }
+
+  /**
+   * Delete screenshots cached before now - maxAgeMs.
+   * @returns {Promise<number>} Rows deleted
+   */
+  async cleanExpiredImages(dbType, dbName, connectionString, maxAgeMs) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.cleanExpiredImages(database, maxAgeMs);
+  }
+
+  /**
+   * Record a profile lookup event.
+   * @returns {Promise<void>}
+   */
+  async logProfileLookup(dbType, dbName, connectionString, username, ip, source) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.logProfileLookup(database, username, ip, source);
+  }
+
+  /**
+   * Get the most recent profile lookups.
+   * @returns {Promise<Array<Object>>} Lookup rows, newest first
+   */
+  async getProfileLookups(dbType, dbName, connectionString, limit) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.getProfileLookups(database, limit);
+  }
+
   /**
    * Close all database connections and clear caches
    *
