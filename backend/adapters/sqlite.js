@@ -101,6 +101,47 @@ export class SQLiteProvider {
         processed_at INTEGER NOT NULL
       )
     `);
+
+    // Create ProfileCache table for X API responses
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ProfileCache (
+        username TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        cached_at INTEGER NOT NULL
+      )
+    `);
+
+    // Create ImageCache table for generated wallpaper screenshots
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ImageCache (
+        username TEXT PRIMARY KEY,
+        image BLOB NOT NULL,
+        cached_at INTEGER NOT NULL
+      )
+    `);
+
+    // Create ProfileImages table for cached avatar/banner images
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ProfileImages (
+        id TEXT PRIMARY KEY,
+        image BLOB NOT NULL,
+        content_type TEXT NOT NULL,
+        cached_at INTEGER NOT NULL
+      )
+    `);
+
+    // Create ProfileLookups table for lookup audit log
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ProfileLookups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        ip TEXT,
+        source TEXT DEFAULT 'web',
+        looked_up_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_lookups_username ON ProfileLookups(username)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_lookups_time ON ProfileLookups(looked_up_at)`);
   }
 
   /**
@@ -490,6 +531,119 @@ export class SQLiteProvider {
       db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  // ==== PROFILE CACHE (X API responses) ====
+
+  /**
+   * Get a cached X profile by username.
+   * @param {Database} db - SQLite database instance
+   * @param {string} username - Username (case-insensitive)
+   * @returns {Promise<{username: string, data: Object, cached_at: number}|null>}
+   */
+  async getCachedProfile(db, username) {
+    const result = db.prepare("SELECT * FROM ProfileCache WHERE username = ?").get(username.toLowerCase());
+    if (result) {
+      return { username: result.username, data: JSON.parse(result.data), cached_at: result.cached_at };
+    }
+    return null;
+  }
+
+  /**
+   * Upsert a cached X profile.
+   * @param {Database} db - SQLite database instance
+   * @param {string} username - Username (case-insensitive)
+   * @param {Object} data - Profile payload to cache
+   * @returns {Promise<void>}
+   */
+  async setCachedProfile(db, username, data) {
+    const sql = `INSERT OR REPLACE INTO ProfileCache (username, data, cached_at) VALUES (?, ?, ?)`;
+    db.prepare(sql).run(username.toLowerCase(), JSON.stringify(data), Date.now());
+  }
+
+  /**
+   * Delete profiles cached before now - maxAgeMs.
+   * @param {Database} db - SQLite database instance
+   * @param {number} maxAgeMs - Max age in milliseconds
+   * @returns {Promise<number>} Rows deleted
+   */
+  async cleanExpiredProfiles(db, maxAgeMs) {
+    const result = db.prepare("DELETE FROM ProfileCache WHERE cached_at < ?").run(Date.now() - maxAgeMs);
+    return result.changes;
+  }
+
+  /**
+   * Delete all cached profiles.
+   * @param {Database} db - SQLite database instance
+   * @returns {Promise<number>} Rows deleted
+   */
+  async clearAllProfiles(db) {
+    const result = db.prepare("DELETE FROM ProfileCache").run();
+    return result.changes;
+  }
+
+  // ==== IMAGE CACHE (generated screenshots) ====
+
+  /**
+   * Get a cached screenshot by cache key.
+   * @param {Database} db - SQLite database instance
+   * @param {string} username - Cache key
+   * @returns {Promise<{username: string, image: Uint8Array, cached_at: number}|null>}
+   */
+  async getCachedImage(db, username) {
+    const result = db.prepare("SELECT * FROM ImageCache WHERE username = ?").get(username.toLowerCase());
+    if (result) {
+      return { username: result.username, image: result.image, cached_at: result.cached_at };
+    }
+    return null;
+  }
+
+  /**
+   * Upsert a cached screenshot.
+   * @param {Database} db - SQLite database instance
+   * @param {string} username - Cache key
+   * @param {Uint8Array} imageBuffer - PNG bytes
+   * @returns {Promise<void>}
+   */
+  async setCachedImage(db, username, imageBuffer) {
+    const sql = `INSERT OR REPLACE INTO ImageCache (username, image, cached_at) VALUES (?, ?, ?)`;
+    db.prepare(sql).run(username.toLowerCase(), imageBuffer, Date.now());
+  }
+
+  /**
+   * Delete screenshots cached before now - maxAgeMs.
+   * @param {Database} db - SQLite database instance
+   * @param {number} maxAgeMs - Max age in milliseconds
+   * @returns {Promise<number>} Rows deleted
+   */
+  async cleanExpiredImages(db, maxAgeMs) {
+    const result = db.prepare("DELETE FROM ImageCache WHERE cached_at < ?").run(Date.now() - maxAgeMs);
+    return result.changes;
+  }
+
+  // ==== PROFILE LOOKUPS (audit log) ====
+
+  /**
+   * Record a profile lookup event.
+   * @param {Database} db - SQLite database instance
+   * @param {string} username - Looked-up username
+   * @param {string|null} ip - Client IP
+   * @param {string} [source='web'] - Lookup source
+   * @returns {Promise<void>}
+   */
+  async logProfileLookup(db, username, ip, source = 'web') {
+    const sql = `INSERT INTO ProfileLookups (username, ip, source, looked_up_at) VALUES (?, ?, ?, ?)`;
+    db.prepare(sql).run(username.toLowerCase(), ip || null, source, Date.now());
+  }
+
+  /**
+   * Get the most recent profile lookups.
+   * @param {Database} db - SQLite database instance
+   * @param {number} [limit=100] - Max rows
+   * @returns {Promise<Array<Object>>} Lookup rows, newest first
+   */
+  async getProfileLookups(db, limit = 100) {
+    return db.prepare("SELECT * FROM ProfileLookups ORDER BY looked_up_at DESC LIMIT ?").all(limit);
   }
 
   /**
