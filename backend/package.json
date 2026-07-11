@@ -7,9 +7,10 @@
         "node": ">=24.0.0"
     },
     "scripts": {
-        "start": "node server.js",
-        "dev": "node --watch server.js",
-        "test": "node --test server.test.js"
+        "start": "node server.ts",
+        "dev": "node --watch server.ts",
+        "test": "node --experimental-test-module-mocks --experimental-test-coverage --test-concurrency=1 --test server.test.ts server.lifecycle.test.js server.prod-import.test.js adapters/*.test.js lib/*.test.js",
+        "test:watch": "node --test --watch server.test.ts"
     },
     "dependencies": {
         "@hono/node-server": "^1.14.1",
@@ -17,5 +18,9 @@
         "hono": "^4.7.11",
         "playwright": "1.59.1",
         "stripe": "^18.5.0"
+    },
+    "devDependencies": {
+        "mongodb": "7.3.0",
+        "pg": "8.21.0"
     }
 }

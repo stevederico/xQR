@@ -1,3 +1,7 @@
+2.2.0
+
+  Upgrade skateboard 4.9.2
+
 2.1.0
 
   Fix security vulnerabilities

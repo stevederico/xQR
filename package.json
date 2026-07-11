@@ -1,7 +1,7 @@
 {
   "name": "xQR",
   "private": false,
-  "version": "2.1.0",
+  "version": "2.2.0",
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
@@ -14,12 +14,23 @@
     "front": "vite --force --mode development",
     "server": "npm run --workspace=backend dev",
     "build": "vite build --mode production && rm -rf backend/public && cp -r dist backend/public",
-    "prod": "node --experimental-sqlite backend/server.js",
+    "prod": "node backend/server.ts",
     "install-all": "npm install && npm install --workspace=backend",
-    "verify:ui": "node scripts/verify-ui-version.mjs"
+    "verify:ui": "node scripts/verify-ui-version.mjs",
+    "postinstall": "git config core.hooksPath .githooks || true",
+    "typecheck": "tsc -p tsconfig.json && tsc -p backend/tsconfig.json",
+    "test": "npm run typecheck && npm run test:backend && npm run test:frontend && npm run test:build",
+    "test:watch": "npm run --workspace=backend test:watch",
+    "test:backend": "npm run test --workspace=backend",
+    "test:frontend": "vitest run --passWithNoTests",
+    "test:build": "node --experimental-test-module-mocks --test vite.plugins.test.js scripts/verify-ui-version.test.js scripts/update-skateboard.test.js scripts/version-consistency.test.js",
+    "test:coverage": "npm run test:coverage:backend && npm run test:coverage:frontend && npm run test:coverage:build",
+    "test:coverage:backend": "node --experimental-test-module-mocks --experimental-test-coverage --test-concurrency=1 --test backend/server.test.ts backend/server.lifecycle.test.js backend/server.prod-import.test.js backend/adapters/*.test.js backend/lib/*.test.js",
+    "test:coverage:frontend": "vitest run --coverage --passWithNoTests",
+    "test:coverage:build": "node --experimental-test-module-mocks --experimental-test-coverage --test vite.plugins.test.js scripts/verify-ui-version.test.js"
   },
   "dependencies": {
-    "@stevederico/skateboard-ui": "3.8.1",
+    "@stevederico/skateboard-ui": "4.11.0",
     "qrcode-generator": "^2.0.4",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
@@ -30,7 +41,16 @@
     "@tailwindcss/vite": "^4.2.2",
     "@vitejs/plugin-react-swc": "^4.3.0",
     "tailwindcss": "4.2.2",
-    "vite": "^8.0.3"
+    "vite": "^8.0.3",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "25.9.1",
+    "@types/react": "19.2.16",
+    "@types/react-dom": "19.2.3",
+    "@vitest/coverage-v8": "^3.2.4",
+    "jsdom": "^26.1.0",
+    "typescript": "6.0.3",
+    "vitest": "^3.2.4"
   },
-  "skateboardVersion": "3.6.1"
+  "skateboardVersion": "4.9.2"
 }
