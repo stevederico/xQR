@@ -1,34 +1,66 @@
 // ==== IMPORTS ====
 import { Hono } from 'hono'
+import type { Context, Next } from 'hono'
 import { serve } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { secureHeaders } from 'hono/secure-headers'
 import { cors } from 'hono/cors'
 import Stripe from "stripe";
-import { compare as legacyBcryptCompare } from "./vendor/legacy-bcrypt.js";
 import crypto from "crypto";
 import { Client } from "@xdevplatform/xdk";
 
-import { databaseManager } from "./adapters/manager.js";
+import { databaseManager } from "./adapters/manager.ts";
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFile, mkdir, stat, readFileSync, writeFileSync, statSync, existsSync, mkdirSync, unlinkSync, readdirSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
+import type { BackendConfig, BoundDatabase, CsrfTokenEntry, DatabaseConfig, JwtPayload, Logger, Subscription, UserSetFields } from './types.ts';
+import { createLogger } from './lib/logger.ts';
+import { isProd, loadEnvFile, loadLocalENV, resolveEnvironmentVariables, validateEnvironmentVariables } from './lib/env.ts';
+import { escapeHtml, validateEmail, validatePassword, validateName } from './lib/validation.ts';
+import { evictOldestEntries } from './lib/store.ts';
+import {
+  TOKEN_EXPIRATION_DAYS,
+  hashPassword,
+  verifyPassword,
+  needsRehash,
+  tokenExpireTimestamp,
+  jwtSign,
+  jwtVerify,
+  generateUUID,
+} from './lib/auth.ts';
+
+/** Hono context environment: authMiddleware sets userID for downstream middleware/handlers. */
+type AppEnv = { Variables: { userID: string } };
 
 // ==== PLAYWRIGHT (lazy) — used by /qr/:username/image screenshot route ====
 // Loaded on first screenshot request so the server boots without playwright installed.
-let playwright = null;
-let persistentBrowser = null;
+type PlaywrightModule = typeof import('playwright');
+type PlaywrightBrowser = import('playwright').Browser;
+
+// Browser-context globals: these exist only inside Playwright page.evaluate /
+// addInitScript callbacks (which run in the page, not in Node). The backend tsconfig
+// has no DOM lib, so declare the minimal surface the screenshot route touches.
+interface BrowserCacheStorage {
+  keys(): Promise<string[]>;
+  delete(key: string): Promise<boolean>;
+}
+declare const window: { caches?: BrowserCacheStorage };
+declare const caches: BrowserCacheStorage;
+declare const document: { fonts: { ready: Promise<unknown> } };
+let playwright: PlaywrightModule | null = null;
+let persistentBrowser: PlaywrightBrowser | null = null;
 let screenshotCount = 0;
 const MAX_SCREENSHOTS_BEFORE_RESTART = 100;
 
 /**
  * Lazily import playwright. Returns null if not installed (feature disabled).
- * @returns {Promise<object|null>} playwright module or null
+ *
+ * @returns Playwright module or null when unavailable
  */
-async function getPlaywright() {
+async function getPlaywright(): Promise<PlaywrightModule | null> {
   if (playwright) return playwright;
   try {
     playwright = await import("playwright");
@@ -42,9 +74,10 @@ async function getPlaywright() {
 
 /**
  * Close the persistent browser to free memory. Errors are ignored.
- * @returns {Promise<void>}
+ *
+ * @returns void
  */
-async function restartBrowser() {
+async function restartBrowser(): Promise<void> {
   if (persistentBrowser) {
     try {
       await persistentBrowser.close();
@@ -59,9 +92,10 @@ async function restartBrowser() {
 /**
  * Get a healthy persistent WebKit browser instance, launching or restarting as
  * needed for memory management. Returns null if playwright is unavailable.
- * @returns {Promise<object|null>} Browser instance or null
+ *
+ * @returns Browser instance or null when playwright is unavailable
  */
-async function getBrowser() {
+async function getBrowser(): Promise<PlaywrightBrowser | null> {
   const pw = await getPlaywright();
   if (!pw) return null;
 
@@ -84,14 +118,15 @@ const SCREENSHOT_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
 // ==== X API DAILY RATE LIMIT (cache-miss requests only) ====
 // yagni: in-memory per-IP map, swap for shared store if multi-instance
-const xApiRateLimitStore = new Map();
+const xApiRateLimitStore = new Map<string, number[]>();
 
 /**
  * Extract client IP from x-forwarded-for (rightmost = set by trusted proxy).
- * @param {import('hono').Context} c - Hono context
- * @returns {string} Client IP or 'unknown'
+ *
+ * @param c - Hono context
+ * @returns Client IP or 'unknown'
  */
-function getClientIP(c) {
+function getClientIP(c: Context<AppEnv>): string {
   const forwarded = c.req.header('x-forwarded-for');
   if (forwarded) {
     const ips = forwarded.split(',').map(ip => ip.trim());
@@ -100,93 +135,92 @@ function getClientIP(c) {
   return 'unknown';
 }
 
+/**
+ * Determine if this module is being run directly (not imported).
+ *
+ * @param moduleUrl - import.meta.url of the module
+ * @returns True when executed as the entry script
+ */
+export function isMainModule(moduleUrl: string): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return resolve(fileURLToPath(moduleUrl)) === resolve(entry);
+}
+
+/**
+ * Whether the HTTP server and process signal handlers should start.
+ *
+ * @param skipFlag - Skip-server env value
+ * @param moduleUrl - Module URL to compare with argv entry
+ * @returns True when this process should bind a port
+ */
+export function __testShouldStartServer(
+  skipFlag: string | undefined = process.env.SKIP_SERVER_START,
+  moduleUrl: string = import.meta.url
+): boolean {
+  return skipFlag !== '1' && isMainModule(moduleUrl);
+}
+
+const shouldStartServer = __testShouldStartServer();
+
+/**
+ * Resolve HTTP listen port from environment.
+ *
+ * @param env - Environment variables
+ * @returns Parsed port number
+ */
+export function __testResolvePort(env: NodeJS.ProcessEnv = process.env): number {
+  return parseInt(env.PORT || '8000');
+}
+
+/**
+ * Extract a human-readable message from an unknown thrown value.
+ *
+ * Narrows to Error to read `.message`; falls back to String() for non-Error
+ * throwables. Used in catch blocks instead of casting the caught value.
+ *
+ * @param e - Unknown caught value
+ * @returns Error message string
+ */
+const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * Unreference a timer so it doesn't keep the process event loop alive.
+ *
+ * Lets background cleanup intervals run unconditionally (independent of
+ * whether this module is the entry script) without blocking process/test
+ * exit. Guards the call so test doubles that return a non-timer (e.g. a
+ * number) from setInterval are tolerated.
+ *
+ * @param timer - Return value of setInterval
+ * @returns void
+ */
+function unrefTimer(timer: unknown): void {
+  if (timer && typeof timer === 'object' && 'unref' in timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
+}
+
 // ==== SERVER CONFIG ====
-const port = parseInt(process.env.PORT || "8000");
+const port = __testResolvePort();
 
 // ==== STRUCTURED LOGGING ====
 // Defined early so all code can use it (no external dependencies)
-const logger = {
-  error: (message, meta = {}) => {
-    const logEntry = {
-      level: 'ERROR',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta
-    };
-    console.error(!isProd() ? JSON.stringify(logEntry, null, 2) : JSON.stringify(logEntry));
-  },
-
-  warn: (message, meta = {}) => {
-    const logEntry = {
-      level: 'WARN',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta
-    };
-    console.warn(!isProd() ? JSON.stringify(logEntry, null, 2) : JSON.stringify(logEntry));
-  },
-
-  info: (message, meta = {}) => {
-    const logEntry = {
-      level: 'INFO',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta
-    };
-    console.log(!isProd() ? JSON.stringify(logEntry, null, 2) : JSON.stringify(logEntry));
-  },
-
-  debug: (message, meta = {}) => {
-    if (isProd()) return;
-    const logEntry = {
-      level: 'DEBUG',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta
-    };
-    console.log(JSON.stringify(logEntry, null, 2));
-  }
-};
+const logger: Logger = createLogger(isProd);
 
 // ==== CSRF PROTECTION ====
-const csrfTokenStore = new Map(); // userID -> { token, timestamp }
+const csrfTokenStore = new Map<string, CsrfTokenEntry>(); // userID -> { token, timestamp }
 const CSRF_TOKEN_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours
 const CSRF_MAX_ENTRIES = 50000; // LRU eviction threshold
-
-/**
- * LRU eviction helper that removes oldest entries when over limit
- *
- * Prevents memory leaks in CSRF store by removing oldest entries based on
- * timestamp when store exceeds maxEntries threshold.
- *
- * @param {Map} store - Map to evict entries from
- * @param {number} maxEntries - Maximum entries before eviction
- * @param {Function} getTimestamp - Function to extract timestamp from value
- * @returns {void}
- */
-function evictOldestEntries(store, maxEntries, getTimestamp) {
-  if (store.size <= maxEntries) return;
-
-  // Convert to array and sort by timestamp
-  const entries = Array.from(store.entries())
-    .map(([key, value]) => ({ key, timestamp: getTimestamp(value) }))
-    .sort((a, b) => a.timestamp - b.timestamp);
-
-  // Remove oldest entries until under limit
-  const toRemove = store.size - maxEntries;
-  for (let i = 0; i < toRemove; i++) {
-    store.delete(entries[i].key);
-  }
-}
 
 /**
  * Generate cryptographically secure CSRF token
  *
  * Uses crypto.randomBytes to generate 64-character hex token.
  *
- * @returns {string} Hex-encoded CSRF token
+ * @returns Hex-encoded CSRF token
  */
-function generateCSRFToken() {
+function generateCSRFToken(): string {
   return crypto.randomBytes(32).toString('hex');
 }
 
@@ -199,11 +233,11 @@ function generateCSRFToken() {
  * Auto-regenerates token if missing (e.g., server restart) for authenticated users.
  *
  * @async
- * @param {Context} c - Hono context
- * @param {Function} next - Next middleware function
- * @returns {Promise<Response|void>} 403 error or continues to next middleware
+ * @param c - Hono context
+ * @param next - Next middleware function
+ * @returns 403 error or continues to next middleware
  */
-async function csrfProtection(c, next) {
+async function csrfProtection(c: Context<AppEnv>, next: Next) {
   if (c.req.method === 'GET' || c.req.path === '/api/signup' || c.req.path === '/api/signin') {
     return next();
   }
@@ -266,8 +300,12 @@ async function csrfProtection(c, next) {
   await next();
 }
 
-// Cleanup expired CSRF tokens every hour to prevent memory leak
-setInterval(() => {
+/**
+ * Remove expired CSRF tokens and evict oldest entries when over limit.
+ *
+ * @returns void
+ */
+export function __testRunCsrfCleanup(): void {
   const now = Date.now();
   let cleaned = 0;
 
@@ -278,16 +316,43 @@ setInterval(() => {
     }
   }
 
-  // LRU eviction if still over limit
   evictOldestEntries(csrfTokenStore, CSRF_MAX_ENTRIES, (data) => data.timestamp);
 
   if (cleaned > 0) {
     logger.debug('CSRF cleanup completed', { removedTokens: cleaned });
   }
-}, 60 * 60 * 1000); // Run every hour
+}
+
+/**
+ * Register hourly CSRF cleanup interval.
+ *
+ * @returns void
+ */
+export function __testRegisterCsrfInterval(): void {
+  unrefTimer(setInterval(__testRunCsrfCleanup, 60 * 60 * 1000));
+}
+
+/**
+ * Register CSRF cleanup interval when server startup is enabled.
+ *
+ * @param shouldStart - Whether startup hooks are active
+ * @returns void
+ */
+export function __testRegisterCsrfIntervalIfStarted(shouldStart: boolean = shouldStartServer): void {
+  if (shouldStart) {
+    __testRegisterCsrfInterval();
+  }
+}
+
+// Register unconditionally (not gated on shouldStartServer): csrfTokenStore
+// capacity/expiry cleanup must run whenever this module is loaded — including
+// when imported by a wrapper/bootstrap rather than run as the entry script —
+// or the store would grow without bound. The timer is unref'd so it never
+// blocks process/test exit.
+__testRegisterCsrfInterval();
 
 // ==== ACCOUNT LOCKOUT ====
-const loginAttemptStore = new Map(); // email -> { attempts, lockedUntil }
+const loginAttemptStore = new Map<string, { attempts: number; lockedUntil: number | null }>(); // email -> { attempts, lockedUntil }
 const LOCKOUT_THRESHOLD = 5; // Lock after 5 failed attempts
 const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 minutes
 const LOCKOUT_MAX_ENTRIES = 50000; // LRU eviction threshold
@@ -295,10 +360,10 @@ const LOCKOUT_MAX_ENTRIES = 50000; // LRU eviction threshold
 /**
  * Check if account is locked due to failed login attempts
  *
- * @param {string} email - Email address to check
- * @returns {{locked: boolean, remainingTime: number}} Lock status and remaining time in seconds
+ * @param email - Email address to check
+ * @returns Lock status and remaining time in seconds
  */
-function isAccountLocked(email) {
+function isAccountLocked(email: string): { locked: boolean; remainingTime: number } {
   const record = loginAttemptStore.get(email);
   if (!record) return { locked: false, remainingTime: 0 };
 
@@ -323,10 +388,9 @@ function isAccountLocked(email) {
  *
  * Increments attempt counter. Locks account after LOCKOUT_THRESHOLD failures.
  *
- * @param {string} email - Email address that failed login
- * @returns {void}
+ * @param email - Email address that failed login
  */
-function recordFailedLogin(email) {
+function recordFailedLogin(email: string): void {
   const now = Date.now();
   let record = loginAttemptStore.get(email);
 
@@ -346,15 +410,18 @@ function recordFailedLogin(email) {
 /**
  * Clear failed login attempts on successful login
  *
- * @param {string} email - Email address to clear
- * @returns {void}
+ * @param email - Email address to clear
  */
-function clearFailedLogins(email) {
+function clearFailedLogins(email: string): void {
   loginAttemptStore.delete(email);
 }
 
-// Cleanup expired lockout entries every 15 minutes
-setInterval(() => {
+/**
+ * Remove expired lockout entries and evict oldest when over limit.
+ *
+ * @returns void
+ */
+export function __testRunLockoutCleanup(): void {
   const now = Date.now();
   let cleaned = 0;
 
@@ -365,121 +432,145 @@ setInterval(() => {
     }
   }
 
-  // LRU eviction if still over limit
   evictOldestEntries(loginAttemptStore, LOCKOUT_MAX_ENTRIES, (data) => data.lockedUntil || 0);
 
   if (cleaned > 0) {
     logger.debug('Lockout cleanup completed', { removedEntries: cleaned });
   }
-}, 15 * 60 * 1000);
+}
+
+/**
+ * Register lockout cleanup interval.
+ *
+ * @returns void
+ */
+export function __testRegisterLockoutInterval(): void {
+  unrefTimer(setInterval(__testRunLockoutCleanup, 15 * 60 * 1000));
+}
+
+/**
+ * Register lockout cleanup interval when server startup is enabled.
+ *
+ * @param shouldStart - Whether startup hooks are active
+ * @returns void
+ */
+export function __testRegisterLockoutIntervalIfStarted(shouldStart: boolean = shouldStartServer): void {
+  if (shouldStart) {
+    __testRegisterLockoutInterval();
+  }
+}
+
+// Register unconditionally (see CSRF interval note): loginAttemptStore
+// capacity/expiry cleanup must run on every module load, unref'd so it never
+// blocks process/test exit.
+__testRegisterLockoutInterval();
+
+/**
+ * Register production hourly maintenance interval when running in production.
+ *
+ * @param prod - Production mode flag
+ * @param shouldStart - Whether server startup hooks are enabled
+ * @returns void
+ */
+export function __testMaybeRegisterProdHourlyInterval(
+  prod: boolean = isProd(),
+  shouldStart: boolean = shouldStartServer
+): void {
+  if (prod && shouldStart) {
+    __testRegisterProdHourlyInterval();
+  }
+}
+
+/**
+ * Register production hourly maintenance interval.
+ *
+ * @returns void
+ */
+export function __testRegisterProdHourlyInterval(): void {
+  unrefTimer(setInterval(__testRunProdHourlyTask, 60 * 60 * 1000));
+}
+
+/**
+ * Production-only hourly maintenance task.
+ *
+ * @returns void
+ */
+export function __testRunProdHourlyTask(): void {
+  logger.debug('Hourly task completed');
+}
 
 // ==== CONFIG & ENV ====
 // Environment setup - MUST happen before config loading
 if (!isProd()) {
-  loadLocalENV();
-} else {
-  setInterval(async () => {
-    logger.debug('Hourly task completed');
-  }, 60 * 60 * 1000); // Every hour
+  loadLocalENV({ logger });
+}
+__testMaybeRegisterProdHourlyInterval();
+
+/**
+ * Validate the parsed config.json shape: a `database` object carrying string
+ * `db`, `dbType`, and `connectionString`. Narrows unknown JSON before use.
+ *
+ * @param value - Parsed JSON value
+ * @returns True if the value matches the expected config shape
+ */
+function isRawConfig(value: unknown): value is { staticDir?: string; database: DatabaseConfig } {
+  if (typeof value !== 'object' || value === null || !('database' in value)) return false;
+  const { database } = value;
+  if (typeof database !== 'object' || database === null) return false;
+  return 'db' in database && typeof database.db === 'string'
+    && 'dbType' in database && typeof database.dbType === 'string'
+    && 'connectionString' in database && typeof database.connectionString === 'string';
 }
 
 /**
- * Resolve environment variable placeholders in configuration strings
+ * Load application config from config.json with fallback defaults.
  *
- * Replaces ${VAR_NAME} patterns with process.env values. Logs warning
- * and preserves placeholder if environment variable is undefined.
- *
- * @param {string} str - String with ${VAR_NAME} placeholders
- * @returns {string} String with placeholders replaced
+ * @returns Resolved application config
  */
-function resolveEnvironmentVariables(str) {
-  if (typeof str !== 'string') return str;
-
-  return str.replace(/\$\{([^}]+)\}/g, (match, varName) => {
-    const envValue = process.env[varName];
-    if (envValue === undefined) {
-      logger.warn('Environment variable not defined, using placeholder', { varName, placeholder: match });
-      return match; // Return the placeholder if env var is not found
+export async function __testLoadApplicationConfig(): Promise<BackendConfig> {
+  try {
+    const configFilename = fileURLToPath(import.meta.url);
+    const configDirname = dirname(configFilename);
+    const configPath = resolve(configDirname, './config.json');
+    const configData = await promisify(readFile)(configPath);
+    const parsedConfig: unknown = JSON.parse(configData.toString());
+    if (!isRawConfig(parsedConfig)) {
+      throw new Error('Invalid config.json shape');
     }
-    return envValue;
-  });
+    const rawConfig = parsedConfig;
+
+    return {
+      staticDir: rawConfig.staticDir || '../dist',
+      database: {
+        ...rawConfig.database,
+        connectionString: resolveEnvironmentVariables(rawConfig.database.connectionString, logger)
+      }
+    };
+  } catch (err) {
+    logger.error('Failed to load config, using defaults', { error: errorMessage(err) });
+    return {
+      staticDir: '../dist',
+      database: {
+        db: "MyApp",
+        dbType: "sqlite",
+        connectionString: process.env.TEST_DATABASE_PATH || "./databases/MyApp.db"
+      }
+    };
+  }
 }
 
-// Load and process configuration
-let config;
-try {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
-  const configPath = resolve(__dirname, './config.json');
-  const configData = await promisify(readFile)(configPath);
-  const rawConfig = JSON.parse(configData.toString());
-
-  // Resolve environment variables in configuration
-  config = {
-    staticDir: rawConfig.staticDir || '../dist',
-    database: {
-      ...rawConfig.database,
-      connectionString: resolveEnvironmentVariables(rawConfig.database.connectionString)
-    }
-  };
-} catch (err) {
-  logger.error('Failed to load config, using defaults', { error: err.message });
-  config = {
-    staticDir: '../dist',
-    database: {
-      db: "MyApp",
-      dbType: "sqlite",
-      connectionString: "./databases/MyApp.db"
-    }
-  };
-}
+let config: BackendConfig = await __testLoadApplicationConfig();
 
 const STRIPE_KEY = process.env.STRIPE_KEY;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-/**
- * Validate required environment variables are set
- *
- * Checks for STRIPE_KEY, STRIPE_ENDPOINT_SECRET, JWT_SECRET, and any
- * unresolved ${VAR} references in database config. Logs warnings for
- * missing variables but does not exit the process.
- *
- * @returns {boolean} True if all required variables are present
- */
-function validateEnvironmentVariables() {
-  const missing = [];
-
-  if (!STRIPE_KEY) missing.push('STRIPE_KEY');
-  if (!process.env.STRIPE_ENDPOINT_SECRET) missing.push('STRIPE_ENDPOINT_SECRET');
-  if (!JWT_SECRET) missing.push('JWT_SECRET');
-
-  // Check for database environment variables that are referenced but not defined
-  if (typeof config.database.connectionString === 'string') {
-    const matches = config.database.connectionString.match(/\$\{([^}]+)\}/g);
-    if (matches) {
-      matches.forEach(match => {
-        const varName = match.slice(2, -1); // Remove ${ and }
-        if (!process.env[varName]) {
-          missing.push(`${varName} (referenced in database config)`);
-        }
-      });
-    }
-  }
-
-  if (missing.length > 0) {
-    logger.warn('Missing environment variables - server continuing with limited functionality', {
-      missing,
-      hint: 'Set DATABASE_URL, MONGODB_URL, POSTGRES_URL, STRIPE_KEY, JWT_SECRET for full functionality'
-    });
-
-    // Don't exit - let the server continue with warnings
-    return false;
-  }
-
-  return true;
-}
-
-const envValidationPassed = validateEnvironmentVariables();
+const envValidationPassed = validateEnvironmentVariables({
+  config,
+  stripeKey: STRIPE_KEY,
+  stripeEndpointSecret: process.env.STRIPE_ENDPOINT_SECRET,
+  jwtSecret: JWT_SECRET,
+  logger
+});
 
 if (envValidationPassed) {
   logger.info('Environment variables validated successfully');
@@ -492,22 +583,39 @@ logger.info('Single-client backend initialized');
 const dbConfig = config.database;
 
 // ==== SERVICES SETUP ====
-// Stripe setup (only if key is available)
-let stripe = null;
-if (STRIPE_KEY) {
-  stripe = new Stripe(STRIPE_KEY);
-} else {
+/**
+ * Log warning when Stripe is disabled due to missing API key.
+ *
+ * @returns void
+ */
+export function __testWarnStripeDisabled(): void {
   logger.warn('STRIPE_KEY not set - Stripe functionality disabled');
 }
 
 // X API client (env: X_BEARER_TOKEN). Degrades to 503 on /user/:username if unset.
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN;
-let xClient = null;
+let xClient: Client | null = null;
 if (X_BEARER_TOKEN) {
   xClient = new Client({ bearerToken: X_BEARER_TOKEN });
 } else {
   logger.warn('X_BEARER_TOKEN not set - X API functionality disabled');
 }
+
+/**
+ * Initialize Stripe client or disable when API key is missing.
+ *
+ * @param stripeKey - Stripe secret key
+ * @returns Stripe client or null
+ */
+export function __testInitializeStripe(stripeKey: string | undefined): Stripe | null {
+  if (stripeKey) {
+    return new Stripe(stripeKey);
+  }
+  __testWarnStripeDisabled();
+  return null;
+}
+
+let stripe: Stripe | null = __testInitializeStripe(STRIPE_KEY);
 
 // Single database config - always use the same one
 const currentDbConfig = dbConfig;
@@ -518,17 +626,17 @@ const currentDbConfig = dbConfig;
  * Provides shorthand methods for database operations without repeating
  * dbType, db, connectionString on every call.
  *
- * @type {Object}
  * @example
  * // Instead of:
  * await db.findUser( { email });
  * // Use:
  * await db.findUser({ email });
  */
-const db = {
+const db: BoundDatabase = {
   findUser: (query, projection) => databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, query, projection),
   insertUser: (userData) => databaseManager.insertUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, userData),
   updateUser: (query, update) => databaseManager.updateUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, query, update),
+  deleteUser: (query) => databaseManager.deleteUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, query),
   findAuth: (query) => databaseManager.findAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, query),
   insertAuth: (authData) => databaseManager.insertAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, authData),
   updateAuth: (query, update) => databaseManager.updateAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, query, update),
@@ -538,7 +646,7 @@ const db = {
 };
 
 // ==== HONO SETUP ====
-const app = new Hono();
+const app = new Hono<AppEnv>();
 
 // Get __dirname for static file serving
 const __filename = fileURLToPath(import.meta.url);
@@ -552,9 +660,10 @@ if (!existsSync(IMAGE_CACHE_DIR)) {
 
 /**
  * Remove disk-cached images older than PROFILE_CACHE_TTL (best-effort).
- * @returns {void}
+ *
+ * @returns void
  */
-function cleanExpiredDiskCache() {
+function cleanExpiredDiskCache(): void {
   try {
     const files = readdirSync(IMAGE_CACHE_DIR);
     const now = Date.now();
@@ -573,17 +682,18 @@ function cleanExpiredDiskCache() {
     }
     if (deleted > 0) logger.debug('Disk cache cleanup', { removed: deleted });
   } catch (err) {
-    logger.error('Disk cache cleanup error', { error: err.message });
+    logger.error('Disk cache cleanup error', { error: errorMessage(err) });
   }
 }
 
 /**
  * Download an image from an allowlisted X CDN host and cache it to disk.
- * @param {string|null} imageUrl - Source image URL (must be pbs/abs.twimg.com)
- * @param {string} cacheId - Cache key / filename stem
- * @returns {Promise<string|null>} cacheId on success, null on failure/blocked
+ *
+ * @param imageUrl - Source image URL (must be pbs/abs.twimg.com)
+ * @param cacheId - Cache key / filename stem
+ * @returns cacheId on success, null on failure/blocked
  */
-async function cacheImage(imageUrl, cacheId) {
+async function cacheImage(imageUrl: string | null | undefined, cacheId: string): Promise<string | null> {
   if (!imageUrl) return null;
   try {
     const parsed = new URL(imageUrl);
@@ -600,13 +710,14 @@ async function cacheImage(imageUrl, cacheId) {
     await writeFile(filePath, buffer);
     return cacheId;
   } catch (err) {
-    logger.error('Failed to cache image', { cacheId, error: err.message });
+    logger.error('Failed to cache image', { cacheId, error: errorMessage(err) });
     return null;
   }
 }
 
-// Daily cache hygiene: purge expired SQLite + disk caches
-setInterval(async () => {
+// Daily cache hygiene: purge expired SQLite + disk caches. Timer is unref'd so it
+// never keeps the process (or a test run importing this module) alive on its own.
+unrefTimer(setInterval(async () => {
   try {
     const deletedProfiles = await databaseManager.cleanExpiredProfiles(
       currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, PROFILE_CACHE_TTL
@@ -620,15 +731,23 @@ setInterval(async () => {
 
     cleanExpiredDiskCache();
   } catch (err) {
-    logger.error('Cache cleanup error', { error: err.message });
+    logger.error('Cache cleanup error', { error: errorMessage(err) });
   }
-}, 24 * 60 * 60 * 1000);
+}, 24 * 60 * 60 * 1000));
 
-// CORS middleware (needed for development when frontend is on different port)
-// Use CORS_ORIGINS env var in production, fallback to localhost for development
-const corsOrigins = process.env.CORS_ORIGINS
-  ? process.env.CORS_ORIGINS.split(',').map(o => o.trim())
-  : ['http://localhost:5173', 'http://localhost:8000', 'http://127.0.0.1:5173', 'http://127.0.0.1:8000'];
+/**
+ * Resolve allowed CORS origins from environment or development defaults.
+ *
+ * @param env - Environment variables
+ * @returns Allowed CORS origins
+ */
+export function __testResolveCorsOrigins(env: NodeJS.ProcessEnv = process.env): string[] {
+  return env.CORS_ORIGINS
+    ? env.CORS_ORIGINS.split(',').map(o => o.trim())
+    : ['http://localhost:5173', 'http://localhost:8000', 'http://127.0.0.1:5173', 'http://127.0.0.1:8000'];
+}
+
+const corsOrigins = __testResolveCorsOrigins();
 
 app.use('*', cors({
   origin: corsOrigins,
@@ -637,8 +756,14 @@ app.use('*', cors({
   credentials: true
 }));
 
-// Apache Common Log Format middleware
-app.use('*', async (c, next) => {
+/**
+ * Apache Common Log Format request logger middleware.
+ *
+ * @param c - Hono context
+ * @param next - Next middleware
+ * @returns void
+ */
+export async function __testApacheLogMiddleware(c: Context<AppEnv>, next: Next): Promise<void> {
   const start = Date.now();
   await next();
   const timestamp = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
@@ -648,157 +773,63 @@ app.use('*', async (c, next) => {
   const duration = Date.now() - start;
 
   console.log(`[${timestamp}] "${method} ${url}" ${status} (${duration}ms)`);
-});
+}
 
-// Security headers middleware
-app.use('*', secureHeaders({
-  contentSecurityPolicy: {
-    defaultSrc: ["'self'"],
-    scriptSrc: ["'self'", "'unsafe-inline'"],
-    styleSrc: ["'self'", "'unsafe-inline'"],
-    imgSrc: ["'self'", "https:"],
-    fontSrc: ["'self'"],
-    connectSrc: ["'self'"],
-    frameAncestors: ["'none'"]
-  },
-  strictTransportSecurity: !isProd() ? false : 'max-age=31536000; includeSubDomains; preload',
-  xFrameOptions: 'DENY',
-  xContentTypeOptions: 'nosniff',
-  referrerPolicy: 'strict-origin-when-cross-origin',
-  permissionsPolicy: {
-    camera: [],
-    microphone: [],
-    geolocation: [],
-    payment: []
-  }
-}));
+app.use('*', __testApacheLogMiddleware);
 
-// Request logging middleware (dev only)
-app.use('*', async (c, next) => {
-  if (!isProd()) {
+/**
+ * Build secure-headers middleware options for the current environment.
+ *
+ * @param prod - Production mode flag
+ * @returns Secure headers config
+ */
+export function __testBuildSecureHeadersOptions(prod: boolean = isProd()) {
+  return {
+    contentSecurityPolicy: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "https:"],
+      fontSrc: ["'self'"],
+      connectSrc: ["'self'"],
+      frameAncestors: ["'none'"]
+    },
+    strictTransportSecurity: !prod ? false as const : 'max-age=31536000; includeSubDomains; preload',
+    xFrameOptions: 'DENY' as const,
+    xContentTypeOptions: 'nosniff' as const,
+    referrerPolicy: 'strict-origin-when-cross-origin' as const,
+    permissionsPolicy: {
+      camera: [],
+      microphone: [],
+      geolocation: [],
+      payment: []
+    }
+  };
+}
+
+app.use('*', secureHeaders(__testBuildSecureHeadersOptions()));
+
+/**
+ * Development-only request logging middleware.
+ *
+ * @param c - Hono context
+ * @param next - Next middleware
+ * @param prod - Production mode flag
+ * @returns void
+ */
+export async function __testDevRequestLogMiddleware(
+  c: Context<AppEnv>,
+  next: Next,
+  prod: boolean = isProd()
+): Promise<void> {
+  if (!prod) {
     const requestId = Math.random().toString(36).substr(2, 9);
     logger.debug('Request received', { method: c.req.method, path: c.req.path, requestId });
   }
   await next();
-});
-
-const tokenExpirationDays = 30;
-
-const scryptAsync = promisify(crypto.scrypt);
-const SCRYPT_KEYLEN = 64;
-const SCRYPT_SALTLEN = 16;
-
-/**
- * Hash password using node:crypto scrypt
- *
- * Format: `scrypt$<base64url salt>$<base64url key>`. New hashes always use
- * scrypt; legacy bcrypt hashes (prefix `$2`) are verified via the dispatch
- * in verifyPassword but never created.
- *
- * @async
- * @param {string} password - Plain text password to hash
- * @returns {Promise<string>} Scrypt hash string
- */
-async function hashPassword(password) {
-  const salt = crypto.randomBytes(SCRYPT_SALTLEN);
-  const key = await scryptAsync(password, salt, SCRYPT_KEYLEN);
-  return `scrypt$${salt.toString('base64url')}$${key.toString('base64url')}`;
 }
 
-/**
- * Verify password against stored hash (scrypt or legacy bcrypt)
- *
- * Dispatches on stored hash prefix: `scrypt$` → native scrypt verify;
- * `$2` → bcryptjs (legacy users predating the scrypt migration).
- *
- * @async
- * @param {string} password - Plain text password to verify
- * @param {string} stored - Stored hash (scrypt or bcrypt format)
- * @returns {Promise<boolean>} True if password matches stored hash
- */
-async function verifyPassword(password, stored) {
-  if (typeof stored !== 'string') return false;
-  if (stored.startsWith('scrypt$')) {
-    const [, saltB64, keyB64] = stored.split('$');
-    const salt = Buffer.from(saltB64, 'base64url');
-    const expected = Buffer.from(keyB64, 'base64url');
-    const candidate = await scryptAsync(password, salt, SCRYPT_KEYLEN);
-    return expected.length === candidate.length && crypto.timingSafeEqual(expected, candidate);
-  }
-  if (stored.startsWith('$2')) {
-    return await legacyBcryptCompare(password, stored);
-  }
-  return false;
-}
-
-/**
- * Whether a stored hash should be migrated to scrypt on next successful login
- *
- * @param {string} stored - Stored hash
- * @returns {boolean} True if the hash is in legacy bcrypt format
- */
-function needsRehash(stored) {
-  return typeof stored === 'string' && !stored.startsWith('scrypt$');
-}
-
-/**
- * Calculate JWT expiration timestamp
- *
- * @returns {number} Unix timestamp 30 days in the future
- */
-function tokenExpireTimestamp(){
-  return Math.floor(Date.now() / 1000) + tokenExpirationDays * 24 * 60 * 60; // 30 days from now
-}
-
-/**
- * Sign an HS256 JWT using node:crypto HMAC-SHA256
- *
- * Produces a token byte-compatible with jsonwebtoken: header
- * {"alg":"HS256","typ":"JWT"} followed by the payload, joined and signed
- * over `base64url(header).base64url(payload)`.
- *
- * @param {Object} payload - Payload to encode (must include exp)
- * @param {string} secret - HMAC signing secret
- * @returns {string} Compact JWT string
- */
-function jwtSign(payload, secret) {
-  const head = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  const sig = crypto.createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
-  return `${head}.${body}.${sig}`;
-}
-
-/**
- * Verify an HS256 JWT and return its payload
- *
- * Compatible with tokens issued by jsonwebtoken (same algorithm, same secret).
- * Throws an Error with name === 'TokenExpiredError' for expired tokens, or a
- * generic Error for malformed/invalid signatures.
- *
- * @param {string} token - JWT string to verify
- * @param {string} secret - HMAC verification secret
- * @returns {Object} Decoded payload
- * @throws {Error} If token is malformed, signature invalid, or expired
- */
-function jwtVerify(token, secret) {
-  const parts = token.split('.');
-  if (parts.length !== 3) throw new Error('Invalid token');
-  const [head, body, sig] = parts;
-  if (!head || !body || !sig) throw new Error('Invalid token');
-  const expected = crypto.createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
-  const sigBuf = Buffer.from(sig);
-  const expBuf = Buffer.from(expected);
-  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-    throw new Error('Invalid signature');
-  }
-  const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
-  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
-    const err = new Error('Token expired');
-    err.name = 'TokenExpiredError';
-    throw err;
-  }
-  return payload;
-}
+app.use('*', __testDevRequestLogMiddleware);
 
 /**
  * Generate JWT token for user authentication
@@ -807,22 +838,23 @@ function jwtVerify(token, secret) {
  * environment variable.
  *
  * @async
- * @param {string} userID - User ID to encode in token
- * @returns {Promise<string>} Signed JWT token
- * @throws {Error} If JWT_SECRET not configured or signing fails
+ * @param userID - User ID to encode in token
+ * @returns Signed JWT token
+ * @throws If JWT_SECRET not configured or signing fails
  */
-async function generateToken(userID) {
+async function generateToken(userID: string): Promise<string> {
   try {
-    if (!JWT_SECRET) {
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
       throw new Error("JWT_SECRET not configured - authentication disabled");
     }
 
     const exp = tokenExpireTimestamp();
     const payload = { userID, exp };
 
-    return jwtSign(payload, JWT_SECRET);
+    return jwtSign(payload, jwtSecret);
   } catch (error) {
-    logger.error('Token generation error', { error: error.message });
+    logger.error('Token generation error', { error: errorMessage(error) });
     throw error;
   }
 }
@@ -836,12 +868,13 @@ async function generateToken(userID) {
  * JWT_SECRET not configured.
  *
  * @async
- * @param {Context} c - Hono context
- * @param {Function} next - Next middleware function
- * @returns {Promise<Response|void>} 401/503 error or continues to next middleware
+ * @param c - Hono context
+ * @param next - Next middleware function
+ * @returns 401/503 error or continues to next middleware
  */
-async function authMiddleware(c, next) {
-  if (!JWT_SECRET) {
+async function authMiddleware(c: Context<AppEnv>, next: Next) {
+  const jwtSecret = process.env.JWT_SECRET;
+  if (!jwtSecret) {
     return c.json({ error: "Authentication service unavailable" }, 503);
   }
 
@@ -852,103 +885,20 @@ async function authMiddleware(c, next) {
   }
 
   try {
-    const payload = jwtVerify(token, JWT_SECRET);
+    const payload = jwtVerify(token, jwtSecret);
     // Normalize userID to string for consistent Map key usage (CSRF, sessions)
     const normalizedUserID = String(payload.userID);
     c.set('userID', normalizedUserID);
     await next();
   } catch (error) {
-    if (error.name === 'TokenExpiredError') {
+    if (error instanceof Error && error.name === 'TokenExpiredError') {
       logger.debug('Token expired');
       return c.json({ error: "Token expired" }, 401);
     }
-    logger.error('Token verification error', { error: error.message });
+    logger.error('Token verification error', { error: errorMessage(error) });
     return c.json({ error: "Invalid token" }, 401);
   }
 }
-
-/**
- * Generate RFC 4122 compliant UUID v4
- *
- * Uses crypto.randomUUID() for cryptographically secure unique identifiers.
- *
- * @returns {string} UUID string
- */
-function generateUUID() {
-  return crypto.randomUUID();
-}
-
-/**
- * Escape HTML special characters to prevent XSS attacks
- *
- * Replaces &, <, >, ", ', / with HTML entities. Returns original value
- * if not a string.
- *
- * @param {string} text - Text to escape
- * @returns {string} HTML-escaped text
- */
-const escapeHtml = (text) => {
-  if (typeof text !== 'string') return text;
-  const map = {
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#x27;',
-    '/': '&#x2F;',
-  };
-  return text.replace(/[&<>"'/]/g, (char) => map[char]);
-};
-
-/**
- * Validate email address format and length
- *
- * RFC 5321 compliant validation with robust regex checking local part,
- * domain, and TLD. Max length 254 characters. Prevents consecutive dots
- * and leading/trailing hyphens.
- *
- * @param {string} email - Email address to validate
- * @returns {boolean} True if valid email format
- */
-const validateEmail = (email) => {
-  if (!email || typeof email !== 'string') return false;
-  if (email.length > 254) return false; // RFC 5321
-
-  // More robust email validation:
-  // - Local part: letters, numbers, and common special chars (no consecutive dots)
-  // - Domain: letters, numbers, hyphens (no consecutive dots or leading/trailing hyphens)
-  // - TLD: 2-63 characters
-  const emailRegex = /^[a-zA-Z0-9](?:[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]*[a-zA-Z0-9])?@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,63}$/;
-  return emailRegex.test(email);
-};
-
-/**
- * Validate password length within bcrypt limits
- *
- * Enforces 6-72 character range (bcrypt's maximum is 72 bytes).
- *
- * @param {string} password - Password to validate
- * @returns {boolean} True if valid password length
- */
-const validatePassword = (password) => {
-  if (!password || typeof password !== 'string') return false;
-  if (password.length < 6 || password.length > 72) return false; // bcrypt limit
-  return true;
-};
-
-/**
- * Validate name length and non-empty after trim
- *
- * Enforces 1-100 character range after trimming whitespace.
- *
- * @param {string} name - Name to validate
- * @returns {boolean} True if valid name
- */
-const validateName = (name) => {
-  if (!name || typeof name !== 'string') return false;
-  if (name.trim().length === 0 || name.length > 100) return false;
-  return true;
-};
 
 /**
  * Set authentication cookies and generate CSRF token for user session
@@ -956,13 +906,12 @@ const validateName = (name) => {
  * Creates CSRF token, stores it in memory, and sets both JWT (HttpOnly) and
  * CSRF (readable) cookies. Consolidates duplicate cookie logic from signup/signin.
  *
- * @async
- * @param {Context} c - Hono context
- * @param {string} userID - User ID to associate with session
- * @param {string} jwtToken - Pre-generated JWT token
- * @returns {string} Generated CSRF token
+ * @param c - Hono context
+ * @param userID - User ID to associate with session
+ * @param jwtToken - Pre-generated JWT token
+ * @returns Generated CSRF token
  */
-function setAuthCookies(c, userID, jwtToken) {
+function setAuthCookies(c: Context<AppEnv>, userID: string, jwtToken: string): string {
   const csrfToken = generateCSRFToken();
   csrfTokenStore.set(userID.toString(), { token: csrfToken, timestamp: Date.now() });
 
@@ -972,7 +921,7 @@ function setAuthCookies(c, userID, jwtToken) {
     secure: isProd(),
     sameSite: 'Strict',
     path: '/',
-    maxAge: tokenExpirationDays * 24 * 60 * 60
+    maxAge: TOKEN_EXPIRATION_DAYS * 24 * 60 * 60
   });
 
   // Set CSRF token cookie (readable by frontend)
@@ -990,13 +939,95 @@ function setAuthCookies(c, userID, jwtToken) {
 // ==== STRIPE WEBHOOK (raw body needed) ====
 
 /**
+ * Subscription fields this server reads from Stripe webhook payloads and
+ * subscription retrievals. Pre-basil Stripe API versions expose
+ * current_period_end at the top level; basil (2025-03-31+) moved it onto each
+ * subscription item.
+ */
+type StripeSubscriptionLike = {
+  current_period_end?: number | null;
+  status: string;
+  items?: { data?: Array<{ current_period_end?: number | null }> };
+};
+
+/**
+ * Resolve a subscription's period end across Stripe API versions: top-level
+ * (pre-basil) first, then the first subscription item (basil). Returns null
+ * when absent so callers store a NULL expires instead of binding undefined
+ * (node:sqlite throws on undefined parameters).
+ */
+function getSubscriptionPeriodEnd(sub: StripeSubscriptionLike): number | null {
+  return sub.current_period_end ?? sub.items?.data?.[0]?.current_period_end ?? null;
+}
+
+/**
+ * Narrow an unknown Stripe payload to the subscription fields this server
+ * reads. Validates `status` is a string; the optional period-end fields are
+ * read defensively by getSubscriptionPeriodEnd, so their presence is not
+ * required here.
+ *
+ * @param value - Unknown Stripe subscription-shaped object
+ * @returns True if the value carries a string `status`
+ */
+function isStripeSubscriptionLike(value: unknown): value is StripeSubscriptionLike {
+  return typeof value === 'object' && value !== null
+    && 'status' in value && typeof value.status === 'string';
+}
+
+/**
+ * Read the customer ID and subscription fields off a webhook event object.
+ *
+ * Replaces an `as unknown as` cast on `event.data.object`: pulls `customer`
+ * (when a string) and the StripeSubscriptionLike fields (status, period-end,
+ * items) directly from the validated object, defaulting `status` to '' when
+ * absent — matching the prior cast's blind-trust behavior without asserting.
+ *
+ * @param value - The webhook `event.data.object`
+ * @returns Customer ID (optional) plus subscription fields
+ */
+function toSubscriptionEvent(value: unknown): { customer?: string } & StripeSubscriptionLike {
+  if (typeof value !== 'object' || value === null) {
+    return { status: '' };
+  }
+  const customer = 'customer' in value && typeof value.customer === 'string' ? value.customer : undefined;
+  const status = 'status' in value && typeof value.status === 'string' ? value.status : '';
+  const current_period_end = 'current_period_end' in value && typeof value.current_period_end === 'number'
+    ? value.current_period_end
+    : undefined;
+  const items = 'items' in value && isStripeSubscriptionItems(value.items) ? value.items : undefined;
+  return { customer, status, current_period_end, items };
+}
+
+/**
+ * Validate the `items` shape read by getSubscriptionPeriodEnd: an object whose
+ * optional `data` is an array of objects with an optional numeric
+ * `current_period_end` (basil API location for the period end).
+ *
+ * @param value - Candidate `items` value
+ * @returns True if the value matches StripeSubscriptionLike['items']
+ */
+function isStripeSubscriptionItems(value: unknown): value is StripeSubscriptionLike['items'] {
+  if (typeof value !== 'object' || value === null) return false;
+  if (!('data' in value)) return true;
+  const { data } = value;
+  if (data === undefined) return true;
+  return Array.isArray(data)
+    && data.every((item) => typeof item === 'object' && item !== null);
+}
+
+/**
  * Resolve a Stripe customer ID to a normalized lowercase email.
  *
- * @param {string} stripeID - Stripe customer ID
- * @returns {Promise<string|null>} Normalized email, or null if missing
+ * @param stripeID - Stripe customer ID
+ * @returns Normalized email, or null if missing
  */
-async function resolveCustomerEmail(stripeID) {
-  const customer = await stripe.customers.retrieve(stripeID);
+async function resolveCustomerEmail(stripeID: string): Promise<string | null> {
+  const s = stripe;
+  if (!s) {
+    logger.warn('Webhook: Stripe not configured', { stripeID });
+    return null;
+  }
+  const customer = await s.customers.retrieve(stripeID) as Stripe.Customer;
   if (!customer?.email) {
     logger.warn('Webhook: Customer has no email', { stripeID });
     return null;
@@ -1008,14 +1039,17 @@ async function resolveCustomerEmail(stripeID) {
  * Build the canonical user.subscription patch from a Stripe customer ID
  * and a Stripe subscription object.
  *
- * @param {string} stripeID - Stripe customer ID
- * @param {object} stripeSub - Stripe subscription object
- * @returns {{stripeID: string, expires: number, status: string}}
+ * @param stripeID - Stripe customer ID
+ * @param stripeSub - Stripe subscription object
  */
-function buildSubscriptionPatch(stripeID, stripeSub) {
+function buildSubscriptionPatch(stripeID: string, stripeSub: Stripe.Subscription): Subscription {
+  const expires = isStripeSubscriptionLike(stripeSub) ? getSubscriptionPeriodEnd(stripeSub) : null;
+  if (expires === null) {
+    logger.error('Webhook: subscription has no current_period_end at top level or item level', { stripeID });
+  }
   return {
     stripeID,
-    expires: stripeSub.current_period_end,
+    expires,
     status: stripeSub.status
   };
 }
@@ -1024,33 +1058,41 @@ function buildSubscriptionPatch(stripeID, stripeSub) {
  * Apply a $set patch to the user identified by email. Returns false if no
  * matching user is found (silent no-op so Stripe will not retry).
  *
- * @param {string} email - Normalized email
- * @param {object} $set - MongoDB-style $set fields
- * @returns {Promise<boolean>} True if a user was patched
+ * @param email - Normalized email
+ * @param $set - MongoDB-style $set fields
+ * @returns True if a user was patched
  */
-async function applyUserPatch(email, $set) {
+async function applyUserPatch(email: string, $set: UserSetFields): Promise<boolean> {
   const user = await db.findUser({ email });
   if (!user) {
     logger.warn('Webhook: No user found for email', { email });
     return false;
   }
-  await db.updateUser({ email }, { $set });
+  await db.updateUser({ _id: user._id }, { $set });
   return true;
 }
 
 app.post("/api/payment", async (c) => {
   logger.info('Payment webhook received');
 
+  const s = stripe;
+  if (!s) return c.json({ error: 'Stripe is not configured' }, 503);
+
   const signature = c.req.header("stripe-signature");
+  if (!signature) return c.json({ error: 'Missing signature' }, 400);
+
+  const endpointSecret = process.env.STRIPE_ENDPOINT_SECRET;
+  if (!endpointSecret) return c.json({ error: 'Stripe is not configured' }, 503);
+
   const rawBody = await c.req.arrayBuffer();
   const body = Buffer.from(rawBody);
 
-  let event;
+  let event: Stripe.Event;
   try {
-    event = await stripe.webhooks.constructEventAsync(body, signature, process.env.STRIPE_ENDPOINT_SECRET);
+    event = await s.webhooks.constructEventAsync(body, signature, endpointSecret);
     logger.debug('Webhook event received', { type: event.type });
   } catch (e) {
-    logger.error('Webhook signature verification failed', { error: e.message });
+    logger.error('Webhook signature verification failed', { error: errorMessage(e) });
     return c.body(null, 400);
   }
 
@@ -1068,22 +1110,27 @@ app.post("/api/payment", async (c) => {
     const eventObject = event.data.object;
 
     if (["customer.subscription.deleted", "customer.subscription.updated", "customer.subscription.created"].includes(event.type)) {
-      const { customer: stripeID, current_period_end, status } = eventObject;
+      const subLike = toSubscriptionEvent(eventObject);
+      const { customer: stripeID, status } = subLike;
       if (!stripeID) {
         logger.error('Webhook missing customer ID', { type: event.type });
         return c.body(null, 400);
       }
       const email = await resolveCustomerEmail(stripeID);
       if (!email) return c.body(null, 400);
-      const ok = await applyUserPatch(email, { subscription: { stripeID, expires: current_period_end, status } });
+      const expires = getSubscriptionPeriodEnd(subLike);
+      if (expires === null) {
+        logger.error('Webhook: subscription event has no current_period_end', { type: event.type, eventId: event.id });
+      }
+      const ok = await applyUserPatch(email, { subscription: { stripeID, expires, status } });
       if (ok) logger.info('Subscription updated', { type: event.type, email, status });
     }
 
     if (event.type === "checkout.session.completed") {
-      const { customer: stripeID, customer_email, subscription: subscriptionId } = eventObject;
+      const { customer: stripeID, customer_email, subscription: subscriptionId } = eventObject as { customer?: string; customer_email?: string | null; subscription?: string };
       if (subscriptionId && stripeID) {
         const [subscription, email] = await Promise.all([
-          stripe.subscriptions.retrieve(subscriptionId),
+          s.subscriptions.retrieve(subscriptionId),
           customer_email ? Promise.resolve(customer_email.toLowerCase()) : resolveCustomerEmail(stripeID)
         ]);
         if (email) {
@@ -1094,10 +1141,17 @@ app.post("/api/payment", async (c) => {
     }
 
     if (event.type === "invoice.paid") {
-      const { customer: stripeID, subscription: subscriptionId } = eventObject;
+      const invoice = eventObject as {
+        customer?: string;
+        subscription?: string;
+        parent?: { subscription_details?: { subscription?: string } };
+      };
+      const stripeID = invoice.customer;
+      // Basil (2025-03-31+) moved the invoice's subscription id under parent.subscription_details.
+      const subscriptionId = invoice.subscription ?? invoice.parent?.subscription_details?.subscription;
       if (subscriptionId && stripeID) {
         const [subscription, email] = await Promise.all([
-          stripe.subscriptions.retrieve(subscriptionId),
+          s.subscriptions.retrieve(subscriptionId),
           resolveCustomerEmail(stripeID)
         ]);
         if (email) {
@@ -1108,7 +1162,7 @@ app.post("/api/payment", async (c) => {
     }
 
     if (event.type === "invoice.payment_failed") {
-      const { customer: stripeID } = eventObject;
+      const { customer: stripeID } = eventObject as { customer?: string };
       if (stripeID) {
         const email = await resolveCustomerEmail(stripeID);
         if (email) {
@@ -1123,7 +1177,7 @@ app.post("/api/payment", async (c) => {
 
     return c.body(null, 200);
   } catch (e) {
-    logger.error('Webhook processing error', { error: e.message });
+    logger.error('Webhook processing error', { error: errorMessage(e) });
     return c.body(null, 500);
   }
 });
@@ -1132,16 +1186,59 @@ app.post("/api/payment", async (c) => {
 app.get("/api/health", (c) => c.json({ status: "ok", timestamp: Date.now() }));
 
 /**
+ * Integration test route handler that throws intentionally (test env only).
+ *
+ * @returns never
+ */
+function __testIntegrationErrorHandler(): never {
+  throw new Error('Intentional integration test error');
+}
+
+if (process.env.NODE_ENV === 'test') {
+  app.get('/api/__integration_error_test__', __testIntegrationErrorHandler);
+}
+
+/**
+ * Sanitize a user-update field value for persistence.
+ *
+ * @param value - Raw request value
+ * @returns Escaped string or original non-string value
+ */
+export function __testSanitizeUserUpdateValue(value: unknown): unknown {
+  return typeof value === 'string' ? escapeHtml(value.trim()) : value;
+}
+
+/**
+ * Resolve usage object from a user record with defaults.
+ *
+ * @param user - User record from database
+ * @returns Usage snapshot
+ */
+export function __testResolveUsage(user: { usage?: { count: number; reset_at: number | null } }): { count: number; reset_at: number | null } {
+  return user.usage || { count: 0, reset_at: null };
+}
+
+/**
+ * Resolve post-increment usage count from an updated user record.
+ *
+ * @param updatedUser - User record after increment
+ * @returns Usage count, defaulting to 1 when missing
+ */
+export function __testResolveActualCount(updatedUser: { usage?: { count: number } } | null | undefined): number {
+  return updatedUser?.usage?.count || 1;
+}
+
+/**
  * Parse JSON request body with proper error handling
  *
  * Returns parsed JSON or null if parsing fails. Sets 400 response on failure.
  * Handles SyntaxError from malformed JSON.
  *
  * @async
- * @param {Context} c - Hono context
- * @returns {Promise<Object|null>} Parsed body or null on error
+ * @param c - Hono context
+ * @returns Parsed body or null on error
  */
-async function parseJsonBody(c) {
+async function parseJsonBody<T = Record<string, unknown>>(c: Context<AppEnv>): Promise<T | null> {
   try {
     return await c.req.json();
   } catch (e) {
@@ -1155,7 +1252,7 @@ async function parseJsonBody(c) {
 // ==== AUTH ROUTES ====
 app.post("/api/signup", async (c) => {
   try {
-    const body = await parseJsonBody(c);
+    const body = await parseJsonBody<{ email: string; password: string; name: string }>(c);
     if (!body) {
       return c.json({ error: 'Invalid request body' }, 400);
     }
@@ -1192,11 +1289,14 @@ app.post("/api/signup", async (c) => {
         await db.insertAuth({ email: email, password: hash, userID: insertID });
       } catch (authError) {
         // Rollback: delete the user we just created
-        logger.error('Auth insert failed, rolling back user creation', { error: authError.message });
+        logger.error('Auth insert failed, rolling back user creation', { error: errorMessage(authError) });
         try {
-          await db.executeQuery({ query: 'DELETE FROM Users WHERE _id = ?', params: [insertID] });
+          const rollback = await db.deleteUser({ _id: insertID });
+          if (rollback.deletedCount !== 1) {
+            logger.error('Rollback failed - orphaned user record', { userID: insertID });
+          }
         } catch (rollbackError) {
-          logger.error('Rollback failed - orphaned user record', { userID: insertID, error: rollbackError.message });
+          logger.error('Rollback failed - orphaned user record', { userID: insertID, error: errorMessage(rollbackError) });
         }
         throw authError;
       }
@@ -1212,21 +1312,23 @@ app.post("/api/signup", async (c) => {
         tokenExpires: tokenExpireTimestamp()
       }, 201);
     } catch (e) {
-      if (e.message?.includes('UNIQUE constraint failed') || e.message?.includes('duplicate key') || e.code === 11000) {
+      const isDuplicate = (e instanceof Error && (e.message.includes('UNIQUE constraint failed') || e.message.includes('duplicate key')))
+        || (typeof e === 'object' && e !== null && 'code' in e && e.code === 11000);
+      if (isDuplicate) {
         logger.warn('Signup failed - duplicate account');
         return c.json({ error: "Unable to create account with provided credentials" }, 400);
       }
       throw e;
     }
   } catch (e) {
-    logger.error('Signup error', { error: e.message });
+    logger.error('Signup error', { error: errorMessage(e) });
     return c.json({ error: "Server error" }, 500);
   }
 });
 
 app.post("/api/signin", async (c) => {
   try {
-    const body = await parseJsonBody(c);
+    const body = await parseJsonBody<{ email: string; password: string }>(c);
     if (!body) {
       return c.json({ error: 'Invalid request body' }, 400);
     }
@@ -1275,7 +1377,7 @@ app.post("/api/signin", async (c) => {
         await db.updateAuth({ email }, { password: newHash });
         logger.debug('Password hash migrated to scrypt');
       } catch (e) {
-        logger.warn('Password rehash failed', { error: e.message });
+        logger.warn('Password rehash failed', { error: errorMessage(e) });
       }
     }
 
@@ -1308,7 +1410,7 @@ app.post("/api/signin", async (c) => {
       tokenExpires: tokenExpireTimestamp()
     });
   } catch (e) {
-    logger.error('Signin error', { error: e.message });
+    logger.error('Signin error', { error: errorMessage(e) });
     return c.json({ error: "Server error" }, 500);
   }
 });
@@ -1339,7 +1441,7 @@ app.post("/api/signout", authMiddleware, async (c) => {
     logger.info('Signout success');
     return c.json({ message: "Signed out successfully" });
   } catch (e) {
-    logger.error('Signout error', { error: e.message });
+    logger.error('Signout error', { error: errorMessage(e) });
     return c.json({ error: "Server error" }, 500);
   }
 });
@@ -1356,7 +1458,7 @@ app.get("/api/me", authMiddleware, async (c) => {
 app.put("/api/me", authMiddleware, csrfProtection, async (c) => {
   try {
     const userID = c.get('userID');
-    const body = await c.req.json();
+    const body = await c.req.json<Record<string, unknown>>();
     const { name } = body;
 
     // Validation
@@ -1372,11 +1474,11 @@ app.put("/api/me", authMiddleware, csrfProtection, async (c) => {
     if (!user) return c.json({ error: "User not found" }, 404);
 
     // Whitelist approach - only allow specific fields
-    const update = {};
+    const update: UserSetFields = {};
     for (const [key, value] of Object.entries(body)) {
       if (UPDATEABLE_USER_FIELDS.includes(key)) {
         // Sanitize string values to prevent XSS
-        update[key] = typeof value === 'string' ? escapeHtml(value.trim()) : value;
+        update[key] = __testSanitizeUserUpdateValue(value) as string;
       }
     }
 
@@ -1395,7 +1497,7 @@ app.put("/api/me", authMiddleware, csrfProtection, async (c) => {
     const updatedUser = await db.findUser( { _id: userID });
     return c.json(updatedUser);
   } catch (err) {
-    logger.error('Update user error', { error: err.message });
+    logger.error('Update user error', { error: errorMessage(err) });
     return c.json({ error: "Failed to update user" }, 500);
   }
 });
@@ -1404,7 +1506,7 @@ app.put("/api/me", authMiddleware, csrfProtection, async (c) => {
 app.post("/api/usage", authMiddleware, async (c) => {
   try {
     const userID = c.get('userID');
-    const body = await c.req.json();
+    const body = await c.req.json<{ operation?: string }>();
     const { operation } = body; // "check" or "track"
 
     if (!operation || !['check', 'track'].includes(operation)) {
@@ -1416,17 +1518,18 @@ app.post("/api/usage", authMiddleware, async (c) => {
     if (!user) return c.json({ error: "User not found" }, 404);
 
     // Check if user is a subscriber - subscribers get unlimited
-    const isSubscriber = user.subscription?.status === 'active' &&
-      (!user.subscription?.expires || user.subscription.expires > Math.floor(Date.now() / 1000));
+    const { subscription } = user;
+    const isSubscriber = subscription?.status === 'active' &&
+      (!subscription.expires || subscription.expires > Math.floor(Date.now() / 1000));
 
-    if (isSubscriber) {
+    if (isSubscriber && subscription) {
       return c.json({
         remaining: -1,
         total: -1,
         isSubscriber: true,
         subscription: {
-          status: user.subscription.status,
-          expiresAt: user.subscription.expires ? new Date(user.subscription.expires * 1000).toISOString() : null
+          status: subscription.status,
+          expiresAt: subscription.expires ? new Date(subscription.expires * 1000).toISOString() : null
         }
       });
     }
@@ -1435,8 +1538,7 @@ app.post("/api/usage", authMiddleware, async (c) => {
     const limit = parseInt(process.env.FREE_USAGE_LIMIT || '20');
     const now = Math.floor(Date.now() / 1000);
 
-    // Initialize usage if not set
-    let usage = user.usage || { count: 0, reset_at: null };
+    let usage = __testResolveUsage(user);
 
     // Check if we need to reset (30 days = 2592000 seconds)
     if (!usage.reset_at || now > usage.reset_at) {
@@ -1459,7 +1561,7 @@ app.post("/api/usage", authMiddleware, async (c) => {
 
       // Re-read user to get actual count after atomic increment
       const updatedUser = await db.findUser( { _id: userID });
-      const actualCount = updatedUser?.usage?.count || 1;
+      const actualCount = __testResolveActualCount(updatedUser);
 
       // If we exceeded the limit, rollback the increment and return 429
       if (actualCount > limit) {
@@ -1491,7 +1593,7 @@ app.post("/api/usage", authMiddleware, async (c) => {
     });
 
   } catch (error) {
-    logger.error('Usage tracking error', { error: error.message });
+    logger.error('Usage tracking error', { error: errorMessage(error) });
     return c.json({ error: "Server error" }, 500);
   }
 });
@@ -1499,8 +1601,11 @@ app.post("/api/usage", authMiddleware, async (c) => {
 // ==== PAYMENT ROUTES ====
 app.post("/api/checkout", authMiddleware, csrfProtection, async (c) => {
   try {
+    const s = stripe;
+    if (!s) return c.json({ error: 'Stripe is not configured' }, 503);
+
     const userID = c.get('userID');
-    const body = await c.req.json();
+    const body = await c.req.json<{ email?: string; lookup_key?: string }>();
     const { email, lookup_key } = body;
 
     if (!email || !lookup_key) return c.json({ error: "Missing email or lookup_key" }, 400);
@@ -1509,7 +1614,7 @@ app.post("/api/checkout", authMiddleware, csrfProtection, async (c) => {
     const user = await db.findUser( { _id: userID });
     if (!user || user.email !== email) return c.json({ error: "Email mismatch" }, 403);
 
-    const prices = await stripe.prices.list({ lookup_keys: [lookup_key], expand: ["data.product"] });
+    const prices = await s.prices.list({ lookup_keys: [lookup_key], expand: ["data.product"] });
 
     if (!prices.data || prices.data.length === 0) {
       return c.json({ error: `No price found for lookup_key: ${lookup_key}` }, 400);
@@ -1518,7 +1623,7 @@ app.post("/api/checkout", authMiddleware, csrfProtection, async (c) => {
     // Use FRONTEND_URL env var or origin header, fallback to localhost for dev
     const origin = process.env.FRONTEND_URL || c.req.header('origin') || `http://localhost:${port}`;
 
-    const session = await stripe.checkout.sessions.create({
+    const session = await s.checkout.sessions.create({
       customer_email: email,
       mode: "subscription",
       payment_method_types: ["card"],
@@ -1530,15 +1635,18 @@ app.post("/api/checkout", authMiddleware, csrfProtection, async (c) => {
     });
     return c.json({ url: session.url, id: session.id, customerID: session.customer });
   } catch (e) {
-    logger.error('Checkout session error', { error: e.message });
+    logger.error('Checkout session error', { error: errorMessage(e) });
     return c.json({ error: "Stripe session failed" }, 500);
   }
 });
 
 app.post("/api/portal", authMiddleware, csrfProtection, async (c) => {
   try {
+    const s = stripe;
+    if (!s) return c.json({ error: 'Stripe is not configured' }, 503);
+
     const userID = c.get('userID');
-    const body = await c.req.json();
+    const body = await c.req.json<{ customerID?: string }>();
     const { customerID } = body;
 
     if (!customerID) return c.json({ error: "Missing customerID" }, 400);
@@ -1551,13 +1659,13 @@ app.post("/api/portal", authMiddleware, csrfProtection, async (c) => {
 
     // Use FRONTEND_URL env var or origin header, fallback to localhost for dev
     const origin = process.env.FRONTEND_URL || c.req.header('origin') || `http://localhost:${port}`;
-    const portalSession = await stripe.billingPortal.sessions.create({
+    const portalSession = await s.billingPortal.sessions.create({
       customer: customerID,
       return_url: `${origin}/app/payment?portal=return`,
     });
     return c.json({ url: portalSession.url, id: portalSession.id });
   } catch (e) {
-    logger.error('Portal session error', { error: e.message });
+    logger.error('Portal session error', { error: errorMessage(e) });
     return c.json({ error: "Stripe portal failed" }, 500);
   }
 });
@@ -1599,7 +1707,7 @@ app.get("/clear-cache", async (c) => {
     logger.info('Caches cleared', { images: files.length, profiles });
     return c.json({ images: files.length, profiles, browser: 'reset' });
   } catch (err) {
-    return c.json({ error: err.message }, 500);
+    return c.json({ error: errorMessage(err) }, 500);
   }
 });
 
@@ -1627,7 +1735,7 @@ app.get("/images/:id", async (c) => {
       'Cache-Control': 'no-store'
     });
   } catch (error) {
-    logger.error('Image serve error', { error: error.message });
+    logger.error('Image serve error', { error: errorMessage(error) });
     return c.json({ error: "Failed to serve image" }, 500);
   }
 });
@@ -1714,9 +1822,9 @@ app.get("/user/:username", async (c) => {
     const avatarId = `${cleanUsername}_avatar`;
     const bannerId = `${cleanUsername}_banner`;
 
-    // XDK returns camelCase (profileImageUrl); handle both formats
-    const profileImageUrl = user.profileImageUrl || user.profile_image_url;
-    const profileBannerUrl = user.profileBannerUrl || user.profile_banner_url;
+    // XDK (@xdevplatform/xdk) returns camelCase fields.
+    const profileImageUrl = user.profileImageUrl;
+    const profileBannerUrl = user.profileBannerUrl;
 
     // Get higher-res avatar (remove _normal suffix)
     const hiResAvatar = profileImageUrl?.replace('_normal', '_400x400');
@@ -1726,7 +1834,7 @@ app.get("/user/:username", async (c) => {
       cacheImage(profileBannerUrl, bannerId)
     ]);
 
-    const metrics = user.publicMetrics || user.public_metrics || {};
+    const metrics = user.publicMetrics || {};
 
     const userData = {
       id: user.id,
@@ -1736,11 +1844,11 @@ app.get("/user/:username", async (c) => {
       profile_banner_url: profileBannerUrl ? `/images/${bannerId}` : null,
       description,
       verified: user.verified,
-      verified_type: user.verifiedType || user.verified_type,
+      verified_type: user.verifiedType,
       location: user.location,
       url: expandedUrl,
       display_url: displayUrl,
-      created_at: user.createdAt || user.created_at,
+      created_at: user.createdAt,
       followers_count: metrics.followersCount || metrics.followers_count,
       following_count: metrics.followingCount || metrics.following_count,
       tweet_count: metrics.tweetCount || metrics.tweet_count
@@ -1753,8 +1861,12 @@ app.get("/user/:username", async (c) => {
 
     return c.json(userData);
   } catch (error) {
-    logger.error('X API error', { username: c.req.param("username"), error: error.message, status: error.status });
-    if (error.status === 404) {
+    let status: number | undefined;
+    if (error !== null && typeof error === 'object' && 'status' in error && typeof error.status === 'number') {
+      status = error.status;
+    }
+    logger.error('X API error', { username: c.req.param("username"), error: errorMessage(error), status });
+    if (status === 404) {
       return c.json({ error: "User not found" }, 404);
     }
     return c.json({ error: "Failed to fetch user data" }, 500);
@@ -1797,7 +1909,7 @@ app.get("/qr/:username/image", async (c) => {
     currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, cacheKey
   );
   if (cachedScreenshot && Date.now() - cachedScreenshot.cached_at < SCREENSHOT_CACHE_TTL) {
-    return c.body(cachedScreenshot.image, 200, {
+    return c.body(new Uint8Array(cachedScreenshot.image), 200, {
       'Content-Type': 'image/png',
       'Content-Disposition': `attachment; filename="${cleanUsername}-qr.png"`,
       'Cache-Control': 'no-store'
@@ -1854,13 +1966,13 @@ app.get("/qr/:username/image", async (c) => {
       cacheKey, screenshot
     );
 
-    return c.body(screenshot, 200, {
+    return c.body(new Uint8Array(screenshot), 200, {
       'Content-Type': 'image/png',
       'Content-Disposition': `attachment; filename="${cleanUsername}-qr.png"`,
       'Cache-Control': 'no-store'
     });
   } catch (error) {
-    logger.error('Screenshot failed', { username: cleanUsername, error: error.message });
+    logger.error('Screenshot failed', { username: cleanUsername, error: errorMessage(error) });
     if (context) await context.close();
     return c.json({ error: "Failed to generate image" }, 500);
   }
@@ -1895,7 +2007,7 @@ app.get('/:username', async (c) => {
   if (cached?.data) {
     const d = cached.data;
     const title = escapeHtml(`${d.name} (@${d.username})`);
-    const desc = escapeHtml(d.description || `View ${d.name}'s X profile wallpaper`);
+    const desc = escapeHtml(typeof d.description === 'string' && d.description ? d.description : `View ${d.name}'s X profile wallpaper`);
     const img = escapeHtml(d.profile_image_url ? `${c.req.url.split('/' + username)[0]}${d.profile_image_url}` : '/icons/icon.png');
     const url = escapeHtml(c.req.url);
 
@@ -1944,121 +2056,169 @@ app.onError((err, c) => {
   }, 500);
 });
 
-// ==== UTILITY FUNCTIONS ====
-
-/**
- * Check if the server is running in production mode
- *
- * Reads the NODE_ENV environment variable. Returns true only when
- * NODE_ENV is explicitly set to "production".
- *
- * @returns {boolean} True if NODE_ENV === "production"
- */
-function isProd() {
-  return process.env.NODE_ENV === 'production';
-}
-
-/**
- * Load environment variables from .env and optional .env.local file.
- *
- * Reads in two passes: backend/.env first (may be symlink to shared creds),
- * then backend/.env.local for project-specific overrides (wins on conflict).
- * Creates .env from .env.example if it doesn't exist. Only called in
- * non-production mode — Railway injects vars directly in prod.
- *
- * @returns {void}
- */
-function loadLocalENV() {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
-  const envFilePath = resolve(__dirname, './.env');
-  const envLocalPath = resolve(__dirname, './.env.local');
-  const envExamplePath = resolve(__dirname, './.env.example');
-
-  // Check if .env exists, if not create it from .env.example
-  try {
-    statSync(envFilePath);
-  } catch (err) {
-    try {
-      const exampleData = readFileSync(envExamplePath, 'utf8');
-      writeFileSync(envFilePath, exampleData);
-    } catch (exampleErr) {
-      logger.error('Failed to create .env from template', { error: exampleErr.message });
-      return;
-    }
-  }
-
-  // Load .env (may be symlink to shared creds)
-  loadEnvFile(envFilePath);
-
-  // Load .env.local overrides (project-specific, optional)
-  loadEnvFile(envLocalPath);
-}
-
-/**
- * Parse a .env file and apply key=value pairs to process.env.
- * Skips blank lines and comments. Handles quoted values and values containing '='.
- * Silently skips if file doesn't exist.
- * @param {string} filePath - Absolute path to the .env file
- * @returns {void}
- */
-function loadEnvFile(filePath) {
-  try {
-    const data = readFileSync(filePath, 'utf8');
-    for (let line of data.split(/\r?\n/)) {
-      if (!line || line.trim().startsWith('#')) continue;
-      let [key, ...valueParts] = line.split('=');
-      let value = valueParts.join('=');
-      if (key && value) {
-        key = key.trim();
-        value = value.trim().replace(/^["']|["']$/g, '');
-        process.env[key] = value;
-      }
-    }
-  } catch {
-    // File doesn't exist or unreadable — silent
-  }
-}
-
 // ==== SERVER STARTUP ====
-const server = serve({
-  fetch: app.fetch,
-  port,
-  hostname: '::'  // Listen on both IPv4 and IPv6
-}, (info) => {
+let server: ReturnType<typeof serve> | null = null;
+
+/**
+ * Log successful server startup.
+ *
+ * @param info - Server listen info from @hono/node-server
+ * @returns void
+ */
+export function __testOnServerStarted(info: { port: number }): void {
   logger.info('Server started successfully', {
     port: info.port,
     environment: !isProd() ? 'development' : 'production'
   });
-});
-
-// Handle graceful shutdown on SIGTERM and SIGINT - NEED THIS FOR PROXY
-if (typeof process !== 'undefined') {
-  const gracefulShutdown = async (signal) => {
-    console.log(`${signal} received. Shutting down gracefully...`);
-
-    // Close HTTP server first
-    server.close(async () => {
-      console.log('Server closed');
-
-      // Close all database connections with error handling
-      try {
-        await databaseManager.closeAll();
-        console.log('Database connections closed');
-      } catch (err) {
-        console.error('Error closing database connections:', err);
-      }
-
-      process.exit(0);
-    });
-
-    // Force exit after 10 seconds if graceful shutdown hangs
-    setTimeout(() => {
-      console.error('Forced shutdown after timeout');
-      process.exit(1);
-    }, 10000);
-  };
-
-  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
+
+type ShutdownOptions = {
+  exit?: (code: number) => void;
+  setForceExitTimeout?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+};
+
+/**
+ * Gracefully shut down HTTP server and database connections.
+ *
+ * @param httpServer - HTTP server instance
+ * @param signal - Signal name (SIGTERM, SIGINT)
+ * @param options - Shutdown options for tests
+ * @returns void
+ */
+export function __testGracefulShutdown(
+  httpServer: { close: (cb: () => void) => void },
+  signal: string,
+  options: ShutdownOptions = {}
+): void {
+  const exit = options.exit ?? process.exit.bind(process);
+  const setForceExitTimeout = options.setForceExitTimeout ?? ((fn, ms) => setTimeout(fn, ms));
+
+  console.log(`${signal} received. Shutting down gracefully...`);
+
+  httpServer.close(async () => {
+    console.log('Server closed');
+
+    try {
+      await databaseManager.closeAll();
+      console.log('Database connections closed');
+    } catch (err) {
+      console.error('Error closing database connections:', err);
+    }
+
+    exit(0);
+  });
+
+  setForceExitTimeout(() => {
+    console.error('Forced shutdown after timeout');
+    exit(1);
+  }, 10000);
+}
+
+/**
+ * Register SIGTERM/SIGINT handlers for graceful shutdown.
+ *
+ * @param httpServer - HTTP server instance
+ * @returns void
+ */
+export function __testRegisterGracefulShutdown(httpServer: { close: (cb: () => void) => void }): void {
+  if (typeof process !== 'undefined') {
+    process.on('SIGTERM', () => __testGracefulShutdown(httpServer, 'SIGTERM'));
+    process.on('SIGINT', () => __testGracefulShutdown(httpServer, 'SIGINT'));
+  }
+}
+
+let __testServeFactory: typeof serve = serve;
+
+/**
+ * Replace the HTTP server factory used by default startup (tests only).
+ *
+ * @param factory - Injectable serve implementation
+ * @returns void
+ */
+export function __testSetServeFactory(factory: typeof serve): void {
+  __testServeFactory = factory;
+}
+
+/**
+ * Start HTTP server and register graceful shutdown handlers.
+ *
+ * @param serveFn - Server factory
+ * @returns HTTP server instance
+ */
+export function __testStartHttpServer(serveFn: typeof serve = __testServeFactory) {
+  const httpServer = serveFn({
+    fetch: app.fetch,
+    port,
+    hostname: '::'
+  }, __testOnServerStarted);
+
+  __testRegisterGracefulShutdown(httpServer);
+  return httpServer;
+}
+
+/**
+ * Start HTTP server when startup is enabled.
+ *
+ * @param shouldStart - Whether startup hooks are active
+ * @param serveFn - Server factory
+ * @returns HTTP server instance or null
+ */
+export function __testStartHttpServerIfNeeded(
+  shouldStart: boolean = shouldStartServer,
+  serveFn: typeof serve = __testServeFactory
+) {
+  if (!shouldStart) return null;
+  return __testStartHttpServer(serveFn);
+}
+
+server = __testStartHttpServerIfNeeded();
+
+/**
+ * Replace the module-level Stripe client (for integration tests only).
+ *
+ * @param stripeClient - Mock or real Stripe instance
+ * @returns void
+ */
+export function setStripeForTests(stripeClient: Stripe | null): void {
+  stripe = stripeClient;
+}
+
+export {
+  app,
+  db,
+  config,
+  stripe,
+  csrfTokenStore,
+  loginAttemptStore,
+  logger,
+  isProd,
+  loadEnvFile,
+  loadLocalENV,
+  resolveEnvironmentVariables,
+  validateEnvironmentVariables,
+  escapeHtml,
+  validateEmail,
+  validatePassword,
+  validateName,
+  hashPassword,
+  verifyPassword,
+  needsRehash,
+  jwtSign,
+  jwtVerify,
+  tokenExpireTimestamp,
+  generateUUID,
+  evictOldestEntries,
+  generateCSRFToken,
+  csrfProtection,
+  isAccountLocked,
+  recordFailedLogin,
+  clearFailedLogins,
+  buildSubscriptionPatch,
+  resolveCustomerEmail,
+  applyUserPatch,
+  parseJsonBody,
+  generateToken,
+  authMiddleware,
+  setAuthCookies,
+  shouldStartServer
+};
