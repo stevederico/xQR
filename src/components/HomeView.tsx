@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, type FormEvent, type SyntheticEvent } from "react";
 import { useParams, useSearchParams } from "react-router";
 import qrcode from 'qrcode-generator';
 import { version } from '../../package.json';
@@ -7,17 +7,106 @@ import demoWallpaperDark from '../assets/demo-wallpaper-dark.webp';
 
 const API_BASE = import.meta.env.DEV ? 'http://localhost:8000' : '';
 
+/** X profile payload returned by GET /user/:username */
+interface UserInfo {
+  id?: string;
+  username?: string;
+  name?: string;
+  profile_image_url?: string | null;
+  profile_banner_url?: string | null;
+  description?: string;
+  verified?: boolean;
+  verified_type?: string | null;
+  location?: string | null;
+  url?: string | null;
+  display_url?: string | null;
+  created_at?: string | null;
+  followers_count?: number;
+  following_count?: number;
+  tweet_count?: number;
+}
+
+/**
+ * Returns true when `value` is an Error instance.
+ * @param value - Unknown catch value to narrow
+ */
+function isNamedError(value: unknown): value is Error {
+  return value instanceof Error;
+}
+
+/**
+ * Extract a human-readable message from an unknown catch value.
+ * @param err - Unknown error from try/catch
+ * @param fallback - Message when err is not an Error
+ */
+function errorMessage(err: unknown, fallback: string): string {
+  return isNamedError(err) ? err.message : fallback;
+}
+
+/**
+ * Narrow unknown JSON into a UserInfo object (object boundary check only).
+ * @param data - Parsed JSON body
+ */
+function parseUserInfo(data: unknown): UserInfo {
+  if (typeof data !== 'object' || data === null) {
+    throw new Error('Invalid user response');
+  }
+  // yagni: full field validation; upgrade if API contract becomes untrusted
+  const o = data;
+  const str = (k: string): string | undefined => {
+    if (!(k in o)) return undefined;
+    const v = Reflect.get(o, k);
+    return typeof v === 'string' ? v : undefined;
+  };
+  const strNull = (k: string): string | null | undefined => {
+    if (!(k in o)) return undefined;
+    const v = Reflect.get(o, k);
+    if (v === null) return null;
+    return typeof v === 'string' ? v : undefined;
+  };
+  const num = (k: string): number | undefined => {
+    if (!(k in o)) return undefined;
+    const v = Reflect.get(o, k);
+    return typeof v === 'number' ? v : undefined;
+  };
+  const bool = (k: string): boolean | undefined => {
+    if (!(k in o)) return undefined;
+    const v = Reflect.get(o, k);
+    return typeof v === 'boolean' ? v : undefined;
+  };
+  return {
+    id: str('id'),
+    username: str('username'),
+    name: str('name'),
+    profile_image_url: strNull('profile_image_url'),
+    profile_banner_url: strNull('profile_banner_url'),
+    description: str('description'),
+    verified: bool('verified'),
+    verified_type: strNull('verified_type'),
+    location: strNull('location'),
+    url: strNull('url'),
+    display_url: strNull('display_url'),
+    created_at: strNull('created_at'),
+    followers_count: num('followers_count'),
+    following_count: num('following_count'),
+    tweet_count: num('tweet_count'),
+  };
+}
+
+/**
+ * Home screen: username entry, X profile preview, and wallpaper/QR generation.
+ */
 export default function HomeView() {
   const [username, setUsername] = useState('');
   const [showResult, setShowResult] = useState(false);
   const [generatedUsername, setGeneratedUsername] = useState('');
-  const [userInfo, setUserInfo] = useState(null);
+  const [userInfo, setUserInfo] = useState<UserInfo | null>(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const [error, setError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
-  const [previewBlob, setPreviewBlob] = useState(null);
-  const [previewUrl, setPreviewUrl] = useState(null);
-  const canvasRef = useRef(null);
+  const [previewBlob, setPreviewBlob] = useState<Blob | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const { username: urlUsername } = useParams();
 
   // Detect screenshot mode (Playwright adds ?screenshot=1)
@@ -30,21 +119,33 @@ export default function HomeView() {
     new URLSearchParams(window.location.search).get('u');
 
 
-  // Fetch user info from X API via backend
-  async function fetchUserInfo(user) {
+  /**
+   * Fetch user info from X API via backend.
+   * @param user - X username without @
+   * @returns User profile or null on failure
+   */
+  async function fetchUserInfo(user: string): Promise<UserInfo | null> {
     setLoading(true);
     setError(null);
     try {
       const response = await fetch(`${API_BASE}/user/${user}`);
       if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error || 'User not found');
+        const data: unknown = await response.json();
+        const msg =
+          typeof data === 'object' &&
+          data !== null &&
+          'error' in data &&
+          typeof data.error === 'string'
+            ? data.error
+            : 'User not found';
+        throw new Error(msg);
       }
-      const data = await response.json();
-      setUserInfo(data);
-      return data;
-    } catch (err) {
-      setError(err.message);
+      const data: unknown = await response.json();
+      const info = parseUserInfo(data);
+      setUserInfo(info);
+      return info;
+    } catch (err: unknown) {
+      setError(errorMessage(err, 'User not found'));
       setUserInfo(null);
       return null;
     } finally {
@@ -58,7 +159,7 @@ export default function HomeView() {
     if (usernameToLoad) {
       setGeneratedUsername(usernameToLoad);
       setShowResult(true);
-      fetchUserInfo(usernameToLoad);
+      void fetchUserInfo(usernameToLoad);
     }
   }, [urlUsername, queryUsername]);
 
@@ -92,7 +193,11 @@ export default function HomeView() {
     }
   }, [previewBlob]);
 
-  function createQRCode(user) {
+  /**
+   * Draw a QR code for the given X username onto the canvas.
+   * @param user - X username without @
+   */
+  function createQRCode(user: string): void {
     const url = `https://x.com/${user}`;
 
     const qr = qrcode(0, 'L');
@@ -100,7 +205,9 @@ export default function HomeView() {
     qr.make();
 
     const canvas = canvasRef.current;
+    if (!canvas) return;
     const ctx = canvas.getContext('2d');
+    if (!ctx) return;
     const modules = qr.getModuleCount();
     const cellSize = 8;
     const margin = 4;
@@ -128,7 +235,11 @@ export default function HomeView() {
     }
   }
 
-  async function handleSubmit(e) {
+  /**
+   * Submit username: fetch profile and download wallpaper.
+   * @param e - Form submit event
+   */
+  async function handleSubmit(e: FormEvent<HTMLFormElement>): Promise<void> {
     e.preventDefault();
     if (downloading) return;
     setError(null);
@@ -148,14 +259,14 @@ export default function HomeView() {
       const scale = Math.min(window.devicePixelRatio || 2, 3);
       const screenWidth = window.screen.width;
       const screenHeight = window.screen.height;
-      const deviceHeights = {
+      const deviceHeights: Record<number, number> = {
         393: 852, 430: 932, 390: 844, 428: 926, 375: 812, 414: 896,
       };
       // Cap dimensions to reasonable max for wallpapers
       const MAX_WIDTH = 1200;
       const MAX_HEIGHT = 1000;
       const width = Math.min(screenWidth, MAX_WIDTH);
-      const height = Math.min(deviceHeights[screenWidth] || screenHeight, MAX_HEIGHT);
+      const height = Math.min(deviceHeights[screenWidth] ?? screenHeight, MAX_HEIGHT);
 
       const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
       const response = await fetch(
@@ -176,8 +287,8 @@ export default function HomeView() {
         if (navigator.share && canShareFiles) {
           try {
             await navigator.share({ files: [file], title: `${trimmed} Wallpaper` });
-          } catch (shareErr) {
-            if (shareErr.name !== 'AbortError') {
+          } catch (shareErr: unknown) {
+            if (!isNamedError(shareErr) || shareErr.name !== 'AbortError') {
               // Show image preview with download button (fresh gesture will work)
               setPreviewBlob(imageBlob);
             }
@@ -187,16 +298,16 @@ export default function HomeView() {
           window.open(URL.createObjectURL(imageBlob), '_blank');
         }
       } else {
-        const url = URL.createObjectURL(imageBlob);
+        const objectUrl = URL.createObjectURL(imageBlob);
         const a = document.createElement('a');
-        a.href = url;
+        a.href = objectUrl;
         a.download = `${trimmed}-wallpaper.png`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 100);
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 100);
       }
-    } catch (err) {
+    } catch (err: unknown) {
       console.error('Download failed:', err);
       setError('Failed to generate wallpaper');
     } finally {
@@ -204,19 +315,24 @@ export default function HomeView() {
     }
   }
 
-  function handleReset() {
+  /** Reset result view back to the username form. */
+  function handleReset(): void {
     setShowResult(false);
     setUserInfo(null);
     setError(null);
     setUsername('');
   }
 
-  async function handleSaveImage() {
+  /** Save the on-canvas QR code via share sheet (iOS) or download (other). */
+  async function handleSaveImage(): Promise<void> {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     try {
-      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      const blob = await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob((b) => resolve(b), 'image/png');
+      });
+      if (!blob) return;
       const file = new File([blob], `${generatedUsername}-qr.png`, { type: 'image/png' });
       const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
 
@@ -225,8 +341,8 @@ export default function HomeView() {
         if (navigator.share) {
           try {
             await navigator.share({ files: [file], title: `${generatedUsername} QR Code` });
-          } catch (shareErr) {
-            if (shareErr.name !== 'AbortError') {
+          } catch (shareErr: unknown) {
+            if (!isNamedError(shareErr) || shareErr.name !== 'AbortError') {
               window.open(URL.createObjectURL(blob), '_blank');
             }
           }
@@ -235,18 +351,19 @@ export default function HomeView() {
         }
       } else {
         // Non-iOS: traditional download
-        const url = canvas.toDataURL('image/png');
+        const dataUrl = canvas.toDataURL('image/png');
         const a = document.createElement('a');
-        a.href = url;
+        a.href = dataUrl;
         a.download = `${generatedUsername}-qr.png`;
         a.click();
       }
-    } catch (err) {
+    } catch {
       console.log('Save cancelled');
     }
   }
 
-  async function handleDownloadWallpaper() {
+  /** Download full-resolution wallpaper for the generated username. */
+  async function handleDownloadWallpaper(): Promise<void> {
     if (downloading) return;
     setDownloading(true);
 
@@ -258,7 +375,7 @@ export default function HomeView() {
       const screenHeight = window.screen.height;
 
       // Map to actual device screen heights (logical pixels)
-      const deviceHeights = {
+      const deviceHeights: Record<number, number> = {
         393: 852,  // iPhone 14 Pro, 15 Pro
         430: 932,  // iPhone 14 Pro Max, 15 Pro Max
         390: 844,  // iPhone 14, 13, 12
@@ -271,7 +388,7 @@ export default function HomeView() {
       const MAX_WIDTH = 1200;
       const MAX_HEIGHT = 1000;
       const width = Math.min(screenWidth, MAX_WIDTH);
-      const height = Math.min(deviceHeights[screenWidth] || screenHeight, MAX_HEIGHT);
+      const height = Math.min(deviceHeights[screenWidth] ?? screenHeight, MAX_HEIGHT);
 
       const response = await fetch(
         `${API_BASE}/qr/${generatedUsername}/image?w=${width}&h=${height}&scale=${scale}`
@@ -297,8 +414,8 @@ export default function HomeView() {
         if (navigator.share) {
           try {
             await navigator.share({ files: [file], title: `${generatedUsername} Wallpaper` });
-          } catch (shareErr) {
-            if (shareErr.name !== 'AbortError') {
+          } catch (shareErr: unknown) {
+            if (!isNamedError(shareErr) || shareErr.name !== 'AbortError') {
               window.open(URL.createObjectURL(imageBlob), '_blank');
             }
           }
@@ -307,17 +424,17 @@ export default function HomeView() {
         }
       } else {
         // Non-iOS: traditional anchor download
-        const url = URL.createObjectURL(imageBlob);
+        const objectUrl = URL.createObjectURL(imageBlob);
         const a = document.createElement('a');
-        a.href = url;
+        a.href = objectUrl;
         a.download = `${generatedUsername}-wallpaper.png`;
         a.style.display = 'none';
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 100);
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 100);
       }
-    } catch (err) {
+    } catch (err: unknown) {
       console.error('Download failed:', err);
       await handleSaveImage();
     } finally {
@@ -327,7 +444,7 @@ export default function HomeView() {
 
   // Verified badge SVG - color based on verified_type
   // blue = X Premium, business = gold
-  const VerifiedBadge = ({ type }) => {
+  const VerifiedBadge = ({ type }: { type?: string | null }) => {
     let colorClass = 'text-blue-400'; // default blue
     if (type === 'business') colorClass = 'text-yellow-500';
 
@@ -338,16 +455,22 @@ export default function HomeView() {
     );
   };
 
-  // Format follower count (e.g., 84600 -> "84.6K")
-  function formatCount(num) {
+  /**
+   * Format follower/following counts for display (e.g. 84600 → "84.6K").
+   * @param num - Raw count
+   */
+  function formatCount(num: number | undefined): string {
     if (!num) return '0';
     if (num >= 1000000) return (num / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
     if (num >= 1000) return (num / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
     return num.toString();
   }
 
-  // Format joined date (e.g., "2011-06-01T00:00:00.000Z" -> "Joined June 2011")
-  function formatJoinedDate(dateStr) {
+  /**
+   * Format joined date (e.g. ISO → "Joined June 2011").
+   * @param dateStr - ISO date string or nullish
+   */
+  function formatJoinedDate(dateStr: string | null | undefined): string | null {
     if (!dateStr) return null;
     const date = new Date(dateStr);
     const month = date.toLocaleString('en-US', { month: 'long' });
@@ -355,8 +478,11 @@ export default function HomeView() {
     return `Joined ${month} ${year}`;
   }
 
-  // Extract display URL from full URL
-  function formatUrl(url) {
+  /**
+   * Extract display hostname from a full URL.
+   * @param url - Absolute URL or nullish
+   */
+  function formatUrl(url: string | null | undefined): string | null {
     if (!url) return null;
     try {
       const parsed = new URL(url);
@@ -375,7 +501,7 @@ export default function HomeView() {
             src={previewUrl}
             alt="Wallpaper preview"
             className="max-h-[70vh] max-w-[90vw] object-contain rounded-2xl"
-            onError={(e) => console.error('Image failed to load:', e)}
+            onError={(e: SyntheticEvent<HTMLImageElement>) => console.error('Image failed to load:', e)}
           />
         </div>
         <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
@@ -385,8 +511,8 @@ export default function HomeView() {
               try {
                 await navigator.share({ files: [file], title: `${generatedUsername} Wallpaper` });
                 setPreviewBlob(null);
-              } catch (e) {
-                if (e.name !== 'AbortError') {
+              } catch (e: unknown) {
+                if (!isNamedError(e) || e.name !== 'AbortError') {
                   window.open(previewUrl, '_blank');
                 }
                 setPreviewBlob(null);
@@ -432,7 +558,7 @@ export default function HomeView() {
                   {userInfo?.profile_image_url ? (
                     <img
                       src={`${API_BASE}${userInfo.profile_image_url}`}
-                      alt={userInfo.name}
+                      alt={userInfo.name ?? generatedUsername}
                       className="w-20 h-20 rounded-full border-4 border-white dark:border-black"
                     />
                   ) : (
@@ -483,7 +609,7 @@ export default function HomeView() {
                     </span>
                   )}
                   {(userInfo?.display_url || userInfo?.url) && (
-                    <a href={userInfo.url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-blue-400 hover:underline">
+                    <a href={userInfo.url ?? undefined} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-blue-400 hover:underline">
                       <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
                       </svg>

@@ -1,7 +1,7 @@
 import './assets/styles.css';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Routes, Route } from 'react-router';
-import HomeView from './components/HomeView.jsx';
+import HomeView from './components/HomeView.tsx';
 
 const s = document.createElement('script');
 s.defer = true;
@@ -10,7 +10,12 @@ s.dataset.websiteId = '535354f8-732e-4630-b37a-b837ca1db1ba';
 s.dataset.domains = 'xqr.bixbyapps.com';
 document.head.appendChild(s);
 
-createRoot(document.getElementById('root')).render(
+const root = document.getElementById('root');
+if (!root) {
+  throw new Error('Root element not found');
+}
+
+createRoot(root).render(
   <BrowserRouter>
     <Routes>
       <Route path="/" element={<HomeView />} />

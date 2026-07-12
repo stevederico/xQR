@@ -53,7 +53,7 @@ const REPO = process.env.SKATEBOARD_REPO || 'https://github.com/stevederico/skat
 const BRANCH = process.env.SKATEBOARD_BRANCH || '';
 
 // Template-owned files (current names at HEAD). App-owned files (constants.json,
-// components, config.json, .env, main.jsx) are never touched — see SKIP_NOTE.
+// components, config.json, .env, main.tsx) are never touched — see SKIP_NOTE.
 const ALLOWLIST = [
   'backend/server.ts',
   'backend/server.test.ts',
@@ -86,7 +86,7 @@ const ALLOWLIST = [
   'vite.config.ts',
   'vite.plugins.ts',
   'vite.plugins.test.js',
-  'src/test/setup.js',
+  'src/test/setup.ts',
   'AGENTS.md',
   'Dockerfile',
   '.dockerignore',
@@ -134,7 +134,7 @@ const RENAMES = {
 const SKIP_NOTE = `
 Files NOT updated (app-owned — port manually if needed):
   - src/constants.json
-  - src/main.jsx           (your routes — stays .jsx; Vite handles mixed JS/TS)
+  - src/main.tsx           (your routes — app-owned entry)
   - src/components/*       (your components)
   - src/assets/styles.css  (your theme overrides)
   - backend/config.json
