@@ -11,6 +11,12 @@ RUN npm install && cd backend && npm install
 
 COPY . .
 
+# dottie analytics — build-time env (public repo: id injected at build, never committed)
+ARG VITE_DOTTIE_SRC
+ARG VITE_DOTTIE_ID
+ENV VITE_DOTTIE_SRC=$VITE_DOTTIE_SRC
+ENV VITE_DOTTIE_ID=$VITE_DOTTIE_ID
+
 RUN npm run build
 
 FROM node:24-alpine
