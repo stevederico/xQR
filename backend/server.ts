@@ -1626,7 +1626,6 @@ app.post("/api/checkout", authMiddleware, csrfProtection, async (c) => {
     const session = await s.checkout.sessions.create({
       customer_email: email,
       mode: "subscription",
-      payment_method_types: ["card"],
       line_items: [{ price: prices.data[0].id, quantity: 1 }],
       billing_address_collection: "auto",
       success_url: `${origin}/app/payment?success=true`,
