@@ -47,10 +47,10 @@ xQR creates shareable QR codes for X profiles. Enter a username and get a scanna
 | Technology | Purpose |
 |------------|---------|
 | React 19 | UI Framework |
-| Vite 7.1+ | Build Tool |
+| Vite 8 | Build Tool |
 | Tailwind CSS 4 | Styling |
-| Hono 4 | Backend |
-| @xdevplatform/xdk | X API SDK |
+| Rust | Backend (zero-crate, SQLite, libcurl) |
+| X API v2 | Profile lookup via `X_BEARER_TOKEN` |
 
 <br />
 
@@ -59,19 +59,13 @@ xQR creates shareable QR codes for X profiles. Enter a username and get a scanna
 1. **Install dependencies**
    ```bash
    npm install
-   npm install --workspace=backend
    ```
 
 2. **Configure X API**
 
    Get a Bearer Token from the [X Developer Portal](https://developer.x.com/en/portal/dashboard)
 
-   Copy the example environment file and add your credentials:
-   ```bash
-   cp backend/.env.example backend/.env
-   ```
-
-   Edit `backend/.env` with your values:
+   Create `backend/.env` with your values:
    ```bash
    X_BEARER_TOKEN=your_bearer_token_here
    JWT_SECRET=any_random_string  # Generate with: openssl rand -base64 32
@@ -80,9 +74,10 @@ xQR creates shareable QR codes for X profiles. Enter a username and get a scanna
 3. **Run**
    ```bash
    npm run start
+   cd backend && cargo run
    ```
 
-   App runs at `http://localhost:5173`
+   App runs at `http://localhost:5173`. The API listens on port 8000.
 
 <br />
 
@@ -129,9 +124,9 @@ Returns X profile data:
 - Ensure backend is running on port 8000
 
 **Backend won't start**
-- Make sure all dependencies are installed: `npm install --workspace=backend`
+- From `backend/`, run `cargo run`
 - Check that port 8000 is available
-- Verify `.env` file exists in backend directory
+- Verify `.env` file exists in the backend directory
 
 **API rate limits**
 - X API has rate limits per bearer token
