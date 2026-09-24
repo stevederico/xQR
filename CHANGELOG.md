@@ -1,3 +1,15 @@
+2.4.0
+
+  Match X route behavior
+  Screenshot with Chromium
+  Use forwarded client IP
+
+2.3.0
+
+  Migrate skateboard 5.6
+  Replace Node backend
+  Port profile routes
+
 2.2.0
 
   Upgrade skateboard 4.9.2
