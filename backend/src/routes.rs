@@ -4,6 +4,8 @@
 //! attributes match the Node server so a parity harness can byte-diff them.
 
 use std::collections::BTreeMap;
+use std::os::fd::FromRawFd;
+use std::os::unix::process::CommandExt;
 
 use crate::auth::{self, JwtError, JwtPayload, TOKEN_EXPIRATION_DAYS};
 use crate::config;
@@ -1239,13 +1241,10 @@ fn static_or_spa(state: &AppState, req: &Request) -> Response {
     if req.path.starts_with("/api/") || has_extension(&req.path) {
         return not_found();
     }
-    // A single-segment username gets OG tags only when the SPA shell exists.
-    // Without index.html, `/app` and every other path stay on the welcome fallback
-    // the rest of the server uses for a missing build.
+    // `/:username` is registered ahead of the SPA catch-all. A missing
+    // index.html is 404 text, the same as the Node handler.
     if let Some(name) = og_username(&req.path) {
-        if read_index(state).is_some() {
-            return x_profile_html(state, req, name);
-        }
+        return x_profile_html(state, req, name);
     }
     spa_fallback(state)
 }
@@ -1366,10 +1365,6 @@ fn client_ip(req: &Request) -> String {
 const PROFILE_CACHE_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// One hour. Matches the Node `SCREENSHOT_CACHE_TTL`.
 const SCREENSHOT_CACHE_TTL_MS: i64 = 60 * 60 * 1000;
-/// Consecutive X API failures before calls stop for a minute.
-const X_API_CIRCUIT_LIMIT: u32 = 3;
-/// How long the X API circuit stays open after it trips.
-const X_API_CIRCUIT_OPEN_MS: i64 = 60_000;
 /// X API attempts: the first call plus three retries (1s, 2s, 4s).
 const X_API_ATTEMPTS: u32 = 4;
 
@@ -1448,12 +1443,77 @@ fn admin_ok(state: &AppState, req: &Request) -> bool {
     crypto::ct_eq(secret.as_bytes(), key.as_bytes())
 }
 
-/// Parse `limit`, default 100, capped at 1000. A non-integer falls back to 100.
-fn lookup_limit(req: &Request) -> i64 {
-    match req.query_param("limit") {
-        Some(raw) => raw.parse::<i64>().unwrap_or(100).clamp(0, 1000),
-        None => 100,
+/// JavaScript `parseInt`: leading integer, trailing junk ignored, `None` for NaN.
+fn js_parse_int(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let (sign, rest) = if let Some(rest) = s.strip_prefix('-') {
+        (-1, rest)
+    } else if let Some(rest) = s.strip_prefix('+') {
+        (1, rest)
+    } else {
+        (1, s)
+    };
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
     }
+    digits.parse::<i64>().ok().map(|n| n.saturating_mul(sign))
+}
+
+/// JavaScript `parseFloat` for a leading decimal. `None` when the text is NaN.
+fn js_parse_f64(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    let (sign, rest) = if let Some(rest) = s.strip_prefix('-') {
+        (-1.0, rest)
+    } else if let Some(rest) = s.strip_prefix('+') {
+        (1.0, rest)
+    } else {
+        (1.0, s)
+    };
+    let bytes = rest.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    let mut saw_digit = end > 0;
+    if end < bytes.len() && bytes[end] == b'.' {
+        end += 1;
+        let frac = end;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        saw_digit = saw_digit || end > frac;
+    }
+    if !saw_digit {
+        return None;
+    }
+    rest[..end].parse::<f64>().ok().map(|n| n * sign)
+}
+
+/// `Math.min(parseInt(limit || "100"), 1000)`. `Err` is JavaScript NaN.
+fn lookup_limit(req: &Request) -> Result<i64, ()> {
+    let raw = req.query_param("limit").unwrap_or_else(|| "100".into());
+    let n = js_parse_int(&raw).ok_or(())?;
+    Ok(n.min(1000))
+}
+
+/// Client address for X lookup logs and the daily API cap.
+///
+/// The Node handler takes the rightmost `X-Forwarded-For` entry and otherwise
+/// the literal `unknown`. It does not use the socket peer.
+fn x_client_ip(req: &Request) -> String {
+    if let Some(forwarded) = req.header("x-forwarded-for") {
+        if !forwarded.is_empty() {
+            let last = forwarded.split(',').next_back().unwrap_or("").trim();
+            return last.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// `DISABLE_RATE_LIMIT=true` skips the daily X API cap, read on each miss.
+fn x_rate_disabled(state: &AppState) -> bool {
+    state.disable_x_rate_limit || config::env("DISABLE_RATE_LIMIT").as_deref() == Some("true")
 }
 
 /// Recent profile lookups. Requires `ADMIN_SECRET` in `?key=`.
@@ -1461,7 +1521,10 @@ fn x_lookups(state: &AppState, req: &Request) -> Response {
     if !admin_ok(state, req) {
         return err_json(401, "Unauthorized");
     }
-    let limit = lookup_limit(req);
+    let limit = match lookup_limit(req) {
+        Ok(limit) => limit,
+        Err(()) => return err_json(500, "Internal server error"),
+    };
     let rows = match state.pool.get_profile_lookups(limit) {
         Ok(rows) => rows,
         Err(e) => {
@@ -1529,23 +1592,22 @@ fn x_clear_cache(state: &AppState, req: &Request) -> Response {
     )
 }
 
-/// Delete regular files directly inside `dir`. Subdirectories are left alone.
+/// Delete every directory entry, matching `readdir` + `unlink`.
+///
+/// A subdirectory makes `unlink` fail and the route answers 500, same as Node.
+/// The success count is the number of entries, not a filtered file count.
 fn clear_disk_files(dir: &std::path::Path) -> Result<i64, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
-    let mut removed = 0i64;
+    let mut paths = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
-        let is_file = entry
-            .file_type()
-            .map(|kind| kind.is_file())
-            .unwrap_or(false);
-        if !is_file {
-            continue;
-        }
-        std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
-        removed += 1;
+        paths.push(entry.path());
     }
-    Ok(removed)
+    let count = paths.len() as i64;
+    for path in paths {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(count)
 }
 
 /// Serve a cached avatar or banner. Jpeg is preferred when both extensions exist.
@@ -1573,43 +1635,6 @@ fn x_profile_image(state: &AppState, req: &Request) -> Response {
                 .error("Image serve error", &[("error", json::s(e.to_string()))]);
             err_json(500, "Failed to serve image")
         }
-    }
-}
-
-/// `true` while the X API circuit is open. A minute after it opened, one trial is allowed.
-fn x_circuit_open(state: &AppState, now: i64) -> bool {
-    if state.x_failures.load(std::sync::atomic::Ordering::Relaxed) < X_API_CIRCUIT_LIMIT {
-        return false;
-    }
-    let opened = state
-        .x_circuit_opened_at
-        .load(std::sync::atomic::Ordering::Relaxed);
-    opened == 0 || now.saturating_sub(opened) < X_API_CIRCUIT_OPEN_MS
-}
-
-/// Record a successful X API response and close the circuit.
-fn x_circuit_ok(state: &AppState) {
-    state
-        .x_failures
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-    state
-        .x_circuit_opened_at
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Record an X API failure. The third consecutive failure opens the circuit.
-fn x_circuit_fail(state: &AppState, now: i64) {
-    let n = state
-        .x_failures
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
-    if n >= X_API_CIRCUIT_LIMIT {
-        state
-            .x_circuit_opened_at
-            .store(now, std::sync::atomic::Ordering::Relaxed);
-        state
-            .log
-            .error("X API circuit open", &[("failures", json::i(i64::from(n)))]);
     }
 }
 
@@ -1811,23 +1836,18 @@ fn fetch_x_profile(state: &AppState, bearer: &str, username: &str) -> Result<Str
     )
     .map_err(|_| XFetch::Failed)?;
     if res.status == 404 {
-        x_circuit_ok(state);
         return Err(XFetch::NotFound);
     }
     if !res.ok() {
-        x_circuit_fail(state, config::now_ms());
         return Err(XFetch::Failed);
     }
     let parsed = json::parse(&res.body).map_err(|_| XFetch::Failed)?;
     let Some(data) = parsed.get("data") else {
-        x_circuit_ok(state);
         return Err(XFetch::NotFound);
     };
     if data.is_null() {
-        x_circuit_ok(state);
         return Err(XFetch::NotFound);
     }
-    x_circuit_ok(state);
     let avatar_src = data.get_str("profile_image_url");
     let banner_src = data.get_str("profile_banner_url");
     let avatar_id = format!("{username}_avatar");
@@ -1852,12 +1872,11 @@ fn x_user(state: &AppState, req: &Request) -> Response {
     let Some(clean) = clean_username(raw) else {
         return err_json(400, "Invalid username format");
     };
-    let _ = state.pool.log_profile_lookup(
-        &clean,
-        Some(&client_ip(req)),
-        "api",
-        config::now_ms(),
-    );
+    let ip = x_client_ip(req);
+    let logged_ip = if ip.is_empty() { None } else { Some(ip.as_str()) };
+    let _ = state
+        .pool
+        .log_profile_lookup(&clean, logged_ip, "api", config::now_ms());
     let refresh = req.query_param("refresh").as_deref() == Some("1");
     if !refresh {
         match state.pool.get_cached_profile(&clean) {
@@ -1873,15 +1892,12 @@ fn x_user(state: &AppState, req: &Request) -> Response {
             }
         }
     }
-    if x_circuit_open(state, config::now_ms()) {
-        return err_json(503, "X API service unavailable");
-    }
-    if !state.disable_x_rate_limit {
-        let status = state.x_rate.check_and_record(&client_ip(req), config::now_ms());
+    if !x_rate_disabled(state) {
+        let status = state.x_rate.check_and_record(&ip, config::now_ms());
         if status.limited {
             state
                 .log
-                .warn("X API daily limit exceeded", &[("ip", json::s(client_ip(req)))]);
+                .warn("X API daily limit exceeded", &[("ip", json::s(ip))]);
             return json_res(
                 429,
                 &json::obj([
@@ -1919,24 +1935,6 @@ fn x_user(state: &AppState, req: &Request) -> Response {
     }
 }
 
-/// Whole query parameter as an integer, or `None` when the parameter is absent.
-fn query_i64(req: &Request, name: &str) -> Result<Option<i64>, ()> {
-    match req.query_param(name) {
-        None => Ok(None),
-        Some(raw) if raw.is_empty() => Ok(None),
-        Some(raw) => raw.parse::<i64>().map(Some).map_err(|_| ()),
-    }
-}
-
-/// Whole query parameter as a float, or `None` when the parameter is absent.
-fn query_f64(req: &Request, name: &str) -> Result<Option<f64>, ()> {
-    match req.query_param(name) {
-        None => Ok(None),
-        Some(raw) if raw.is_empty() => Ok(None),
-        Some(raw) => raw.parse::<f64>().map(Some).map_err(|_| ()),
-    }
-}
-
 /// Wallpaper dimensions accepted by the screenshot route.
 fn dims_ok(width: i64, height: i64, scale: f64) -> bool {
     (100..=1200).contains(&width)
@@ -1954,8 +1952,18 @@ fn js_num(n: f64) -> String {
     }
 }
 
-/// First executable named `chromium` or Chrome on `PATH`.
+/// Chromium binary used for wallpaper screenshots.
+///
+/// Prefer `/usr/lib/chromium/chromium` over `/usr/bin/chromium`. The latter is
+/// a desktop launcher that injects Wayland flags and does not exit from a
+/// headless screenshot.
 fn browser_bin() -> Option<std::path::PathBuf> {
+    for fixed in ["/usr/lib/chromium/chromium", "/usr/lib/chromium/chrome"] {
+        let path = std::path::PathBuf::from(fixed);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         for name in [
@@ -1973,7 +1981,206 @@ fn browser_bin() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Run headless Chromium against a localhost page and return the PNG.
+/// `true` when `url` is `http(s)://localhost` or `127.0.0.1`, any port.
+fn is_localhost_http(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = hostport.split(':').next().unwrap_or("");
+    host == "localhost" || host == "127.0.0.1"
+}
+
+/// Headless Chromium speaking the DevTools pipe protocol.
+///
+/// File descriptors 3 and 4 are the pipe Chrome documents for
+/// `--remote-debugging-pipe`: the browser reads fd 3 and writes fd 4.
+/// Messages are NUL-terminated JSON.
+struct CdpBrowser {
+    child: std::process::Child,
+    to_browser: std::fs::File,
+    from_browser: std::fs::File,
+    buf: Vec<u8>,
+    next_id: i64,
+}
+
+impl Drop for CdpBrowser {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl CdpBrowser {
+    /// Launch Chromium with a fresh profile and a DevTools pipe.
+    fn launch(profile: &std::path::Path) -> Result<CdpBrowser, String> {
+        let bin = browser_bin().ok_or_else(|| "screenshot browser is not installed".to_string())?;
+        let mut read_pair = [0i32; 2];
+        let mut write_pair = [0i32; 2];
+        // SAFETY: pipe() writes two fresh descriptors into a caller-owned array.
+        if unsafe { pipe(read_pair.as_mut_ptr()) } != 0 || unsafe { pipe(write_pair.as_mut_ptr()) } != 0
+        {
+            return Err("failed to create the DevTools pipe".into());
+        }
+        let browser_read = read_pair[0];
+        let parent_write = read_pair[1];
+        let parent_read = write_pair[0];
+        let browser_write = write_pair[1];
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("--headless=new")
+            .arg("--disable-gpu")
+            .arg("--no-sandbox")
+            .arg("--disable-dev-shm-usage")
+            .arg("--hide-scrollbars")
+            .arg("--ozone-platform=headless")
+            .arg("--use-angle=swiftshader")
+            .arg("--remote-debugging-pipe")
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: runs in the forked child before exec. dup2 onto 3 and 4 is
+        // the contract Chrome checks before it will speak the pipe protocol.
+        // No heap allocation besides the error path, which only runs if dup2 fails.
+        unsafe {
+            cmd.pre_exec(move || {
+                if dup2(browser_read, 3) == -1 || dup2(browser_write, 4) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // SAFETY: spawn failed, so these pipe ends are still owned here.
+                unsafe {
+                    close(browser_read);
+                    close(parent_write);
+                    close(parent_read);
+                    close(browser_write);
+                }
+                return Err(e.to_string());
+            }
+        };
+        // SAFETY: these descriptors came from pipe() and are still open. The
+        // child inherited them; closing the parent's copies does not close the
+        // child's. File takes ownership so Drop closes them.
+        unsafe {
+            close(browser_read);
+            close(browser_write);
+            Ok(CdpBrowser {
+                child,
+                to_browser: std::fs::File::from_raw_fd(parent_write),
+                from_browser: std::fs::File::from_raw_fd(parent_read),
+                buf: Vec::new(),
+                next_id: 0,
+            })
+        }
+    }
+
+    /// One DevTools call. Events with no id are skipped.
+    fn call(&mut self, method: &str, params: Option<Json>, session: Option<&str>) -> Result<Json, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut msg = BTreeMap::new();
+        msg.insert("id".into(), json::i(id));
+        msg.insert("method".into(), json::s(method));
+        if let Some(session) = session {
+            msg.insert("sessionId".into(), json::s(session));
+        }
+        if let Some(params) = params {
+            msg.insert("params".into(), params);
+        }
+        let bytes = json::stringify(&Json::Obj(msg));
+        use std::io::Write;
+        self.to_browser
+            .write_all(bytes.as_bytes())
+            .and_then(|_| self.to_browser.write_all(&[0]))
+            .and_then(|_| self.to_browser.flush())
+            .map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let message = self.read_message(deadline)?;
+            let parsed = json::parse(message.as_bytes()).map_err(|e| e.to_string())?;
+            if parsed.get_i64("id") != Some(id) {
+                continue;
+            }
+            if parsed.get("error").is_some() {
+                return Err(format!("DevTools {method} failed"));
+            }
+            return Ok(parsed);
+        }
+    }
+
+    /// Read one NUL-terminated DevTools message.
+    fn read_message(&mut self, deadline: std::time::Instant) -> Result<String, String> {
+        use std::io::Read;
+        let mut tmp = [0u8; 8192];
+        loop {
+            if let Some(end) = self.buf.iter().position(|b| *b == 0) {
+                let message = String::from_utf8_lossy(&self.buf[..end]).into_owned();
+                self.buf.drain(..=end);
+                if !message.is_empty() {
+                    return Ok(message);
+                }
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("DevTools timed out".into());
+            }
+            let mut wait = PollFd {
+                fd: file_fd(&self.from_browser),
+                events: POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pollfd describes the live read end of the DevTools pipe.
+            let rc = unsafe { poll((&mut wait) as *mut PollFd, 1, 200) };
+            if rc < 0 {
+                return Err("DevTools poll failed".into());
+            }
+            if rc == 0 {
+                continue;
+            }
+            let n = self.from_browser.read(&mut tmp).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("DevTools pipe closed".into());
+            }
+            self.buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+}
+
+/// `pollfd` layout on Linux, matching `<poll.h>`.
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 1;
+
+extern "C" {
+    fn pipe(fds: *mut i32) -> i32;
+    fn dup2(old: i32, new: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+}
+
+/// Borrow the raw descriptor of a `File` without taking ownership.
+fn file_fd(file: &std::fs::File) -> i32 {
+    use std::os::unix::io::AsRawFd;
+    file.as_raw_fd()
+}
+
+/// Screenshot `url` the way Playwright did: viewport, scale, color scheme, then PNG.
+///
+/// Waits up to 10s for a `canvas` (the QR code) and then 500ms, and still
+/// captures if the canvas never appears.
 fn capture_screenshot(
     url: &str,
     width: i64,
@@ -1981,63 +2188,126 @@ fn capture_screenshot(
     scale: f64,
     theme: &str,
 ) -> Result<Vec<u8>, String> {
-    let bin = browser_bin().ok_or_else(|| "screenshot browser is not installed".to_string())?;
     let dir = std::env::temp_dir().join(format!(
         "xqr-shot-{}-{}",
         std::process::id(),
         config::now_ms()
     ));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let png = dir.join("shot.png");
     let profile = dir.join("profile");
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.arg("--headless=new")
-        .arg("--disable-gpu")
-        .arg("--no-sandbox")
-        .arg("--disable-dev-shm-usage")
-        .arg("--hide-scrollbars")
-        .arg(format!("--user-data-dir={}", profile.display()))
-        .arg(format!("--screenshot={}", png.display()))
-        .arg(format!("--window-size={width},{height}"))
-        .arg(format!("--force-device-scale-factor={}", js_num(scale)))
-        .arg("--virtual-time-budget=12000");
-    if theme == "dark" {
-        cmd.arg("--force-dark-mode");
-    }
-    cmd.arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
+    let mut browser = match CdpBrowser::launch(&profile) {
+        Ok(browser) => browser,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
-            return Err(e.to_string());
+            return Err(e);
         }
     };
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() > std::time::Duration::from_secs(35) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err("screenshot timed out".into());
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(e.to_string());
-            }
-        }
-    };
-    let bytes = std::fs::read(&png).ok().filter(|b| b.starts_with(b"\x89PNG"));
+    let png = screenshot_page(&mut browser, url, width, height, scale, theme);
+    drop(browser);
     let _ = std::fs::remove_dir_all(&dir);
-    match (status.success(), bytes) {
-        (true, Some(bytes)) => Ok(bytes),
-        _ => Err("screenshot failed".into()),
+    png
+}
+
+/// Drive one page inside an already-launched browser and return PNG bytes.
+fn screenshot_page(
+    browser: &mut CdpBrowser,
+    url: &str,
+    width: i64,
+    height: i64,
+    scale: f64,
+    theme: &str,
+) -> Result<Vec<u8>, String> {
+    let created = browser.call(
+        "Target.createTarget",
+        Some(json::obj([("url", json::s(url))])),
+        None,
+    )?;
+    let target = created
+        .get("result")
+        .and_then(|r| r.get_str("targetId"))
+        .ok_or_else(|| "DevTools did not return a target".to_string())?
+        .to_string();
+    let attached = browser.call(
+        "Target.attachToTarget",
+        Some(json::obj([
+            ("targetId", json::s(&target)),
+            ("flatten", Json::Bool(true)),
+        ])),
+        None,
+    )?;
+    let session = attached
+        .get("result")
+        .and_then(|r| r.get_str("sessionId"))
+        .ok_or_else(|| "DevTools did not attach".to_string())?
+        .to_string();
+    let session = session.as_str();
+    browser.call(
+        "Emulation.setDeviceMetricsOverride",
+        Some(json::obj([
+            ("width", json::i(width)),
+            ("height", json::i(height)),
+            ("deviceScaleFactor", Json::Num(scale)),
+            ("mobile", Json::Bool(false)),
+        ])),
+        Some(session),
+    )?;
+    let mut features = BTreeMap::new();
+    features.insert("name".into(), json::s("prefers-color-scheme"));
+    features.insert("value".into(), json::s(theme));
+    browser.call(
+        "Emulation.setEmulatedMedia",
+        Some(Json::Obj({
+            let mut m = BTreeMap::new();
+            m.insert("features".into(), Json::Arr(vec![Json::Obj(features)]));
+            m
+        })),
+        Some(session),
+    )?;
+    browser.call("Page.enable", None, Some(session))?;
+    let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < wait_until {
+        let ev = browser.call(
+            "Runtime.evaluate",
+            Some(json::obj([
+                ("expression", json::s("!!document.querySelector('canvas')")),
+                ("returnByValue", Json::Bool(true)),
+            ])),
+            Some(session),
+        )?;
+        let ready = ev
+            .get("result")
+            .and_then(|r| r.get("result"))
+            .and_then(|r| r.get("value"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        if ready {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    let _ = browser.call(
+        "Runtime.evaluate",
+        Some(json::obj([(
+            "expression",
+            json::s("document.fonts && document.fonts.ready"),
+        )])),
+        Some(session),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let shot = browser.call(
+        "Page.captureScreenshot",
+        Some(json::obj([("format", json::s("png"))])),
+        Some(session),
+    )?;
+    let data = shot
+        .get("result")
+        .and_then(|r| r.get_str("data"))
+        .ok_or_else(|| "DevTools did not return a screenshot".to_string())?;
+    let bytes = crate::crypto::base64_decode(data).ok_or_else(|| "screenshot was not base64".to_string())?;
+    if !bytes.starts_with(b"\x89PNG") {
+        return Err("screenshot was not a PNG".into());
+    }
+    Ok(bytes)
 }
 
 /// PNG response with the same download headers the Node route sent.
@@ -2052,17 +2322,26 @@ fn png_attachment(username: &str, bytes: Vec<u8>) -> Response {
 
 /// Screenshot a cached profile. Refuses to launch a browser for an uncached username.
 fn x_qr_image(state: &AppState, req: &Request) -> Response {
-    let width = match query_i64(req, "w") {
-        Ok(v) => v.unwrap_or(393),
-        Err(()) => return err_json(400, "Invalid dimensions"),
+    let width = match req.query_param("w") {
+        Some(raw) => match js_parse_int(&raw) {
+            Some(n) => n,
+            None => return err_json(400, "Invalid dimensions"),
+        },
+        None => 393,
     };
-    let height = match query_i64(req, "h") {
-        Ok(v) => v.unwrap_or(852),
-        Err(()) => return err_json(400, "Invalid dimensions"),
+    let height = match req.query_param("h") {
+        Some(raw) => match js_parse_int(&raw) {
+            Some(n) => n,
+            None => return err_json(400, "Invalid dimensions"),
+        },
+        None => 852,
     };
-    let scale = match query_f64(req, "scale") {
-        Ok(v) => v.unwrap_or(3.0),
-        Err(()) => return err_json(400, "Invalid dimensions"),
+    let scale = match req.query_param("scale") {
+        Some(raw) => match js_parse_f64(&raw) {
+            Some(n) => n,
+            None => return err_json(400, "Invalid dimensions"),
+        },
+        None => 3.0,
     };
     if !dims_ok(width, height, scale) {
         return err_json(400, "Invalid dimensions");
@@ -2106,6 +2385,13 @@ fn x_qr_image(state: &AppState, req: &Request) -> Response {
         "{base}/app/home?u={clean}&screenshot=1&t={}",
         config::now_ms()
     );
+    if !is_localhost_http(&target) {
+        state.log.error(
+            "Blocked non-localhost screenshot target",
+            &[("targetUrl", json::s(&target))],
+        );
+        return err_json(400, "Invalid target");
+    }
     match capture_screenshot(&target, width, height, scale, theme) {
         Ok(png) => {
             let _ = state
@@ -2450,9 +2736,13 @@ mod tests {
     #[test]
     fn spa_fallback_without_dist() {
         let (state, dir) = test_state();
-        let res = handle(&state, Request::for_test("GET", "/app"));
+        // `/app/home` is two segments, so it is the SPA catch-all rather than `/:username`.
+        let res = handle(&state, Request::for_test("GET", "/app/home"));
         assert_eq!(res.status, 200);
         assert_eq!(res.body, b"Welcome to Skateboard API");
+        let username = handle(&state, Request::for_test("GET", "/ada"));
+        assert_eq!(username.status, 404);
+        assert_eq!(username.body, b"Not found");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3203,24 +3493,15 @@ mod tests {
             assert!(!status.limited);
         }
         let mut req = Request::for_test("GET", "/user/ada");
-        req.peer_ip = "203.0.113.9".into();
+        // Rightmost X-Forwarded-For entry, matching the Node getClientIP helper.
+        req.set_test_header("x-forwarded-for", "10.0.0.1, 203.0.113.9");
         let res = handle(&state, req);
         assert_eq!(res.status, 429, "{}", String::from_utf8_lossy(&res.body));
         assert!(json_body(&res).get_i64("retryAfter").unwrap() > 0);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn user_route_stops_when_the_x_circuit_is_open() {
-        let (state, dir) = test_state_with(&[("X_BEARER_TOKEN", "token-for-tests")]);
-        state
-            .x_failures
-            .store(3, std::sync::atomic::Ordering::Relaxed);
-        state
-            .x_circuit_opened_at
-            .store(config::now_ms(), std::sync::atomic::Ordering::Relaxed);
-        let res = handle(&state, Request::for_test("GET", "/user/ada"));
-        assert_eq!(res.status, 503);
+        let mut probe = Request::for_test("GET", "/user/bob");
+        probe.set_test_header("x-forwarded-for", "10.0.0.1, 203.0.113.9");
+        assert_eq!(x_client_ip(&probe), "203.0.113.9");
+        assert_eq!(x_client_ip(&Request::for_test("GET", "/user/bob")), "unknown");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3338,5 +3619,41 @@ mod tests {
         assert!(is_x_cdn_url("https://pbs.twimg.com/profile.jpg"));
         assert!(!is_x_cdn_url("https://evil.twimg.com.example/a.jpg"));
         assert!(!is_x_cdn_url("http://pbs.twimg.com/a.jpg"));
+    }
+
+    #[test]
+    fn screenshot_honors_color_scheme_when_chromium_is_installed() {
+        if browser_bin().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("xqr-page-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("page.html");
+        std::fs::write(
+            &page,
+            r#"<!doctype html><style>
+              html,body{margin:0;width:100%;height:100%}
+              body{background:#eeeeee}
+              @media (prefers-color-scheme: dark){body{background:#111111}}
+            </style><canvas id="c"></canvas>"#,
+        )
+        .unwrap();
+        let url = format!("file://{}", page.display());
+        let light = capture_screenshot(&url, 80, 40, 1.0, "light").expect("light shot");
+        let dark = capture_screenshot(&url, 80, 40, 1.0, "dark").expect("dark shot");
+        assert!(light.starts_with(b"\x89PNG"));
+        assert!(dark.starts_with(b"\x89PNG"));
+        assert_ne!(light, dark);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dimension_parser_matches_javascript_parse_int() {
+        assert_eq!(js_parse_int("100px"), Some(100));
+        assert_eq!(js_parse_int("  -5"), Some(-5));
+        assert_eq!(js_parse_int("foo"), None);
+        assert_eq!(js_parse_f64("3.5x"), Some(3.5));
+        assert!(is_localhost_http("http://localhost:5173/app/home?u=ada"));
+        assert!(!is_localhost_http("http://example.com/app/home"));
     }
 }

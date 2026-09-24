@@ -1,7 +1,6 @@
 //! Shared server state and its construction from config + environment.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU32};
 
 use crate::config::{self, BackendConfig, Logger};
 use crate::db::Pool;
@@ -51,14 +50,10 @@ pub struct AppState {
     pub admin_secret: Option<String>,
     /// `X_BEARER_TOKEN`. `GET /user/:username` answers 503 when unset.
     pub x_bearer: Option<String>,
-    /// `DISABLE_RATE_LIMIT=true` skips the per-IP X API daily cap.
+    /// `DISABLE_RATE_LIMIT=true` at boot. Also re-read on each X API miss.
     pub disable_x_rate_limit: bool,
     /// Per-IP daily cap on X API cache misses.
     pub x_rate: XApiRateStore,
-    /// Consecutive X API transport or 5xx failures. Three opens the circuit.
-    pub x_failures: AtomicU32,
-    /// Epoch milliseconds when the X API circuit opened. Zero when closed.
-    pub x_circuit_opened_at: AtomicI64,
 }
 
 impl AppState {
@@ -200,8 +195,6 @@ impl AppState {
             x_bearer: config::env_nonempty("X_BEARER_TOKEN"),
             disable_x_rate_limit: config::env("DISABLE_RATE_LIMIT").as_deref() == Some("true"),
             x_rate: XApiRateStore::new(),
-            x_failures: AtomicU32::new(0),
-            x_circuit_opened_at: AtomicI64::new(0),
         })
     }
 
