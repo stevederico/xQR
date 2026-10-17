@@ -46,3 +46,6 @@ coverage
 bun.lock
 backend/target
 backend/cache/
+
+# old frontend build output
+backend/public/

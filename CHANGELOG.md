@@ -1,3 +1,7 @@
+2.4.1
+
+  Ignore backend build output
+
 2.4.0
 
   Match X route behavior
