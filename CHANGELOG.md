@@ -1,3 +1,7 @@
+2.5.0
+
+  Remove aob tracker
+
 2.4.1
 
   Ignore backend build output
